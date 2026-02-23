@@ -5,7 +5,6 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
-    "rer": "^0.1.7",
     "uuid": "^9.0.0"
   },
   "peerDependencies": {

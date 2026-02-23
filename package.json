@@ -11,7 +11,7 @@
     "dev": "tsx watch src/server.ts"
   },
   "dependencies": {
-    "@agents-protocol/sdk": "file:../agents-protocol/sdk",
+    "@agents-protocol/sdk": "file:./vendor/sdk",
     "express": "^4.18.2",
     "uuid": "^9.0.0"
   },

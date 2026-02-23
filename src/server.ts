@@ -45,7 +45,7 @@ app.post('/register', async (req: Request, res: Response) => {
     const specRes = await fetch(specUrl);
     if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
     const spec = await specRes.json();
-    door = AgentDoor.fromOpenAPI(spec, resolvedApiUrl, {
+    door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
       site: { name: siteName, url: siteUrl },
       rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
       audit: audit === true,

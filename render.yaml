@@ -2,10 +2,7 @@ services:
   - type: web
     name: agent-door
     runtime: node
-    buildCommand: npm install --include=dev && npm run build
+    buildCommand: npm install --production
     startCommand: node dist/server.js
-    envVars:
-      - key: PORT
-        value: "10000"
     plan: free
     autoDeploy: true

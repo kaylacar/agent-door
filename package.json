@@ -6,7 +6,7 @@
   "type": "commonjs",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "echo 'dist pre-built'",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts"
   },

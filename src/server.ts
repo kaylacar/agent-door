@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import express, { Request, Response, NextFunction } from 'express';
@@ -16,6 +17,7 @@ app.use(express.json({ limit: '50kb' }));
 
 const registry = new Registry();
 const doors = new Map<string, AgentDoor>();
+const slugPatterns = new Map<string, RegExp>();
 
 // ─── URL validation (SSRF protection) ────────────────────────────────────────
 
@@ -86,6 +88,17 @@ const FETCH_TIMEOUT_MS = 10_000;
 
 const ADMIN_KEY = process.env.ADMIN_KEY;
 
+function timingSafeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    // Compare against self so timing doesn't reveal length difference
+    crypto.timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   if (!ADMIN_KEY) {
     // No key configured — admin endpoints are open (dev mode)
@@ -93,7 +106,7 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   const provided = req.headers['x-admin-key'] ?? req.headers['authorization']?.replace(/^Bearer\s+/i, '');
-  if (provided !== ADMIN_KEY) {
+  if (typeof provided !== 'string' || !timingSafeEqual(provided, ADMIN_KEY)) {
     res.status(401).json({ ok: false, error: 'Invalid or missing admin key' });
     return;
   }
@@ -218,12 +231,12 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     apiUrl: resolvedApiUrl,
     openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
     rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-    audit: false,
     createdAt: new Date(),
   };
 
   registry.register(reg);
   doors.set(slug, door);
+  slugPatterns.set(slug, new RegExp(`^/${escapeRegExp(slug)}`));
 
   const base = gatewayBase(req);
   res.json({
@@ -262,6 +275,7 @@ app.delete('/sites/:slug', requireAdmin, (req: Request, res: Response) => {
   }
   door.destroy();
   doors.delete(slug);
+  slugPatterns.delete(slug);
   registry.delete(slug);
   res.json({ ok: true, data: { slug, deleted: true } });
 });
@@ -282,7 +296,8 @@ app.use('/:slug', (req, res, next) => {
 
   // Strip the slug prefix before passing to the door middleware
   const original = req.url;
-  req.url = original.replace(new RegExp(`^/${escapeRegExp(slug)}`), '') || '/';
+  const pattern = slugPatterns.get(slug)!;
+  req.url = original.replace(pattern, '') || '/';
 
   door.middleware()(req, res, () => {
     // Restore URL if the door didn't handle it
@@ -327,4 +342,4 @@ if (require.main === module) {
   startServer();
 }
 
-export { app, startServer, isPublicUrl, resolveAndValidateUrl, isPrivateIP };
+export { app, startServer, isPublicUrl, resolveAndValidateUrl, isPrivateIP, timingSafeEqual };

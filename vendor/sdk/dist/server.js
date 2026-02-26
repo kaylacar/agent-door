@@ -128,7 +128,8 @@ class AgentDoor {
             // Auto-discovery + CORS on every response
             res.setHeader('Link', `<${this.agentsJsonPath}>; rel="${AGENTS_REL}"`);
             const origin = req.headers['origin'];
-            const allowOrigin = this.corsOrigin === '*' ? '*' : (origin && this.corsOrigin.includes(origin) ? origin : '');
+            const allowedList = Array.isArray(this.corsOrigin) ? this.corsOrigin : [this.corsOrigin];
+            const allowOrigin = this.corsOrigin === '*' ? '*' : (origin && allowedList.includes(origin) ? origin : '');
             if (allowOrigin) {
                 res.setHeader('Access-Control-Allow-Origin', allowOrigin);
                 if (allowOrigin !== '*') res.setHeader('Vary', 'Origin');
@@ -162,7 +163,8 @@ class AgentDoor {
         const corsOrigin = this.corsOrigin;
         return async (request) => {
             const reqOrigin = request.headers.get('origin');
-            const allowOrigin = corsOrigin === '*' ? '*' : (reqOrigin && corsOrigin.includes(reqOrigin) ? reqOrigin : undefined);
+            const fetchAllowedList = Array.isArray(corsOrigin) ? corsOrigin : [corsOrigin];
+            const allowOrigin = corsOrigin === '*' ? '*' : (reqOrigin && fetchAllowedList.includes(reqOrigin) ? reqOrigin : undefined);
             const cors = corsHeaders(agentsJsonPath, allowOrigin);
             // CORS preflight
             if (request.method === 'OPTIONS') {

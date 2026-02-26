@@ -8,6 +8,8 @@ exports.startServer = startServer;
 exports.isPublicUrl = isPublicUrl;
 exports.resolveAndValidateUrl = resolveAndValidateUrl;
 exports.isPrivateIP = isPrivateIP;
+exports.timingSafeEqual = timingSafeEqual;
+const node_crypto_1 = __importDefault(require("node:crypto"));
 const promises_1 = __importDefault(require("node:dns/promises"));
 const node_net_1 = __importDefault(require("node:net"));
 const express_1 = __importDefault(require("express"));
@@ -23,6 +25,7 @@ if (TRUSTED_PROXY) {
 app.use(express_1.default.json({ limit: '50kb' }));
 const registry = new registry_1.Registry();
 const doors = new Map();
+const slugPatterns = new Map();
 // ─── URL validation (SSRF protection) ────────────────────────────────────────
 const BLOCKED_HOSTNAMES = new Set([
     'localhost',
@@ -97,6 +100,16 @@ async function resolveAndValidateUrl(raw) {
 const FETCH_TIMEOUT_MS = 10_000;
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 const ADMIN_KEY = process.env.ADMIN_KEY;
+function timingSafeEqual(a, b) {
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    if (bufA.length !== bufB.length) {
+        // Compare against self so timing doesn't reveal length difference
+        node_crypto_1.default.timingSafeEqual(bufA, bufA);
+        return false;
+    }
+    return node_crypto_1.default.timingSafeEqual(bufA, bufB);
+}
 function requireAdmin(req, res, next) {
     if (!ADMIN_KEY) {
         // No key configured — admin endpoints are open (dev mode)
@@ -104,7 +117,7 @@ function requireAdmin(req, res, next) {
         return;
     }
     const provided = req.headers['x-admin-key'] ?? req.headers['authorization']?.replace(/^Bearer\s+/i, '');
-    if (provided !== ADMIN_KEY) {
+    if (typeof provided !== 'string' || !timingSafeEqual(provided, ADMIN_KEY)) {
         res.status(401).json({ ok: false, error: 'Invalid or missing admin key' });
         return;
     }
@@ -217,11 +230,11 @@ app.post('/register', requireAdmin, async (req, res) => {
         apiUrl: resolvedApiUrl,
         openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
         rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-        audit: false,
         createdAt: new Date(),
     };
     registry.register(reg);
     doors.set(slug, door);
+    slugPatterns.set(slug, new RegExp(`^/${escapeRegExp(slug)}`));
     const base = gatewayBase(req);
     res.json({
         ok: true,
@@ -255,6 +268,7 @@ app.delete('/sites/:slug', requireAdmin, (req, res) => {
     }
     door.destroy();
     doors.delete(slug);
+    slugPatterns.delete(slug);
     registry.delete(slug);
     res.json({ ok: true, data: { slug, deleted: true } });
 });
@@ -271,7 +285,8 @@ app.use('/:slug', (req, res, next) => {
     }
     // Strip the slug prefix before passing to the door middleware
     const original = req.url;
-    req.url = original.replace(new RegExp(`^/${escapeRegExp(slug)}`), '') || '/';
+    const pattern = slugPatterns.get(slug);
+    req.url = original.replace(pattern, '') || '/';
     door.middleware()(req, res, () => {
         // Restore URL if the door didn't handle it
         req.url = original;

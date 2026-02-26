@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import dns from 'node:dns/promises';
 import request from 'supertest';
-import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl } from './server';
+import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl, timingSafeEqual } from './server';
 
 // ─── Unit: isPrivateIP ───────────────────────────────────────────────────────
 
@@ -317,6 +317,27 @@ describe('POST /register (happy path)', () => {
   afterAll(async () => {
     // Cleanup: delete the test registration
     await request(app).delete(`/sites/${slug}`);
+  });
+});
+
+// ─── Unit: timingSafeEqual ────────────────────────────────────────────────────
+
+describe('timingSafeEqual', () => {
+  it('returns true for equal strings', () => {
+    expect(timingSafeEqual('secret123', 'secret123')).toBe(true);
+  });
+
+  it('returns false for different strings of same length', () => {
+    expect(timingSafeEqual('secret123', 'secret124')).toBe(false);
+  });
+
+  it('returns false for different lengths', () => {
+    expect(timingSafeEqual('short', 'muchlonger')).toBe(false);
+    expect(timingSafeEqual('', 'notempty')).toBe(false);
+  });
+
+  it('returns true for empty strings', () => {
+    expect(timingSafeEqual('', '')).toBe(true);
   });
 });
 

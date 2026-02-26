@@ -5,6 +5,5 @@ export interface SiteRegistration {
   apiUrl: string;
   openApiUrl?: string;
   rateLimit: number;
-  audit: boolean;
   createdAt: Date;
 }

@@ -7,6 +7,7 @@ const session_1 = require("./session");
 const rate_limiter_1 = require("./rate-limiter");
 const audit_1 = require("./audit");
 const AGENTS_REL = 'agents';
+const PROXY_TIMEOUT_MS = 15000;
 class AgentDoor {
     config;
     basePath;
@@ -15,6 +16,7 @@ class AgentDoor {
     rateLimiter;
     auditManager;
     rateLimit;
+    corsOrigin;
     agentsTxt;
     agentsJson;
     agentsJsonPath;
@@ -24,6 +26,7 @@ class AgentDoor {
         this.basePath = config.basePath ?? '/.well-known';
         this.capabilities = config.capabilities.flat();
         this.rateLimit = config.rateLimit ?? 60;
+        this.corsOrigin = config.corsOrigin ?? '*';
         this.sessionManager = new session_1.SessionManager(config.sessionTtl ?? 3600, this.capabilities);
         this.rateLimiter = new rate_limiter_1.RateLimiter();
         this.auditManager = config.audit ? new audit_1.AuditManager(config.sessionTtl ?? 3600) : null;
@@ -95,10 +98,13 @@ class AgentDoor {
                             init.body = JSON.stringify(req.body);
                             init.headers = { 'Content-Type': 'application/json' };
                         }
+                        init.signal = AbortSignal.timeout(PROXY_TIMEOUT_MS);
                         const response = await fetch(url.toString(), init);
                         if (!response.ok) {
                             const text = await response.text().catch(() => response.statusText);
-                            throw new Error(`Upstream ${response.status}: ${text}`);
+                            const err = new Error(`Upstream ${response.status}: ${text}`);
+                            err.upstreamStatus = response.status;
+                            throw err;
                         }
                         return response.json();
                     },
@@ -121,7 +127,12 @@ class AgentDoor {
         return async (req, res, next) => {
             // Auto-discovery + CORS on every response
             res.setHeader('Link', `<${this.agentsJsonPath}>; rel="${AGENTS_REL}"`);
-            res.setHeader('Access-Control-Allow-Origin', '*');
+            const origin = req.headers['origin'];
+            const allowOrigin = this.corsOrigin === '*' ? '*' : (origin && this.corsOrigin.includes(origin) ? origin : '');
+            if (allowOrigin) {
+                res.setHeader('Access-Control-Allow-Origin', allowOrigin);
+                if (allowOrigin !== '*') res.setHeader('Vary', 'Origin');
+            }
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
             res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Token');
             if (req.method === 'OPTIONS') {
@@ -148,12 +159,16 @@ class AgentDoor {
     // ─── Fetch-compatible handler (Next.js App Router, Cloudflare Workers, Deno) ─
     handler() {
         const agentsJsonPath = this.agentsJsonPath;
+        const corsOrigin = this.corsOrigin;
         return async (request) => {
+            const reqOrigin = request.headers.get('origin');
+            const allowOrigin = corsOrigin === '*' ? '*' : (reqOrigin && corsOrigin.includes(reqOrigin) ? reqOrigin : undefined);
+            const cors = corsHeaders(agentsJsonPath, allowOrigin);
             // CORS preflight
             if (request.method === 'OPTIONS') {
                 return new globalThis.Response(null, {
                     status: 204,
-                    headers: corsHeaders(agentsJsonPath),
+                    headers: cors,
                 });
             }
             const agentReq = await webRequestToAgentRequest(request);
@@ -161,11 +176,11 @@ class AgentDoor {
             if (result === null) {
                 return new globalThis.Response(JSON.stringify({ ok: false, error: 'Not found' }), {
                     status: 404,
-                    headers: { 'Content-Type': 'application/json', ...corsHeaders(agentsJsonPath) },
+                    headers: { 'Content-Type': 'application/json', ...cors },
                 });
             }
             const headers = {
-                ...corsHeaders(agentsJsonPath),
+                ...cors,
                 'Content-Type': result.contentType ?? 'application/json',
             };
             const body = result.contentType
@@ -283,7 +298,15 @@ class AgentDoor {
                         return { status: 200, body: { ok: true, data } };
                     }
                     catch (err) {
-                        return { status: 400, body: { ok: false, error: err.message ?? 'Unknown error' } };
+                        const message = err.message ?? 'Unknown error';
+                        // Map upstream HTTP errors to 502, timeouts to 504, others to 400
+                        let status = 400;
+                        if (err.upstreamStatus) {
+                            status = 502;
+                        } else if (err.name === 'TimeoutError' || message.includes('timed out')) {
+                            status = 504;
+                        }
+                        return { status, body: { ok: false, error: status >= 500 ? 'Upstream service error' : message } };
                     }
                 },
             });
@@ -313,12 +336,13 @@ class AgentDoor {
 }
 exports.AgentDoor = AgentDoor;
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function corsHeaders(agentsJsonPath) {
+function corsHeaders(agentsJsonPath, origin) {
     return {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': origin ?? '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token',
         'Link': `<${agentsJsonPath}>; rel="agents"`,
+        ...(origin && origin !== '*' ? { 'Vary': 'Origin' } : {}),
     };
 }
 function rateLimitResponse() {

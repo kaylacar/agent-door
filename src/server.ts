@@ -5,7 +5,13 @@ import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
 import { SiteRegistration } from './types';
 
+const CORS_ORIGINS = process.env.CORS_ORIGINS; // comma-separated allowlist, or unset for '*'
+const TRUSTED_PROXY = process.env.TRUSTED_PROXY; // e.g. 'loopback' or '10.0.0.0/8'
+
 const app = express();
+if (TRUSTED_PROXY) {
+  app.set('trust proxy', TRUSTED_PROXY);
+}
 app.use(express.json({ limit: '50kb' }));
 
 const registry = new Registry();
@@ -26,9 +32,13 @@ const PRIVATE_IP_RE = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|12
 function isPrivateIP(ip: string): boolean {
   if (BLOCKED_HOSTNAMES.has(ip)) return true;
   if (PRIVATE_IP_RE.test(ip)) return true;
+  if (ip === '0.0.0.0') return true;
   if (net.isIPv6(ip)) {
     const normalized = ip.toLowerCase();
     if (normalized === '::1' || normalized.startsWith('fe80:') || normalized.startsWith('fc00:') || normalized.startsWith('fd')) return true;
+    // Block IPv6-mapped IPv4 addresses (::ffff:127.0.0.1)
+    const v4Mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4Mapped && isPrivateIP(v4Mapped[1])) return true;
   }
   return false;
 }
@@ -56,10 +66,15 @@ async function resolveAndValidateUrl(raw: string): Promise<boolean> {
   if (!isPublicUrl(raw)) return false;
   // If it's already an IP, check directly
   if (net.isIP(parsed.hostname)) return !isPrivateIP(parsed.hostname);
-  // Resolve DNS to catch rebinding attacks
+  // Resolve DNS (both A and AAAA) to catch rebinding attacks
   try {
-    const addresses = await dns.resolve4(parsed.hostname);
-    return addresses.every(ip => !isPrivateIP(ip));
+    const [v4, v6] = await Promise.all([
+      dns.resolve4(parsed.hostname).catch(() => [] as string[]),
+      dns.resolve6(parsed.hostname).catch(() => [] as string[]),
+    ]);
+    const all = [...v4, ...v6];
+    if (all.length === 0) return false; // unresolvable hostname
+    return all.every(ip => !isPrivateIP(ip));
   } catch {
     return false;
   }
@@ -88,8 +103,10 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
 // ─── Gateway URL helper ──────────────────────────────────────────────────────
 
 function gatewayBase(req: Request): string {
-  const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
-  const host = req.headers['x-forwarded-host'] ?? req.get('host') ?? 'localhost';
+  // Only trust x-forwarded-* headers when trust proxy is configured.
+  // Express populates req.protocol from x-forwarded-proto only when trusted.
+  const proto = req.protocol; // respects 'trust proxy' setting
+  const host = req.get('host') ?? 'localhost'; // respects 'trust proxy' setting
   return `${proto}://${host}`;
 }
 
@@ -104,6 +121,20 @@ app.get('/', (_req, res) => {
 const registerWindow = new Map<string, number[]>();
 const REGISTER_LIMIT = 10; // max registrations per IP per window
 const REGISTER_WINDOW_MS = 60_000;
+
+// Periodic cleanup to prevent unbounded memory growth from stale IPs
+const registerCleanupInterval = setInterval(() => {
+  const cutoff = Date.now() - REGISTER_WINDOW_MS;
+  for (const [ip, timestamps] of registerWindow) {
+    const recent = timestamps.filter(t => t > cutoff);
+    if (recent.length === 0) {
+      registerWindow.delete(ip);
+    } else {
+      registerWindow.set(ip, recent);
+    }
+  }
+}, 30_000);
+registerCleanupInterval.unref(); // don't prevent process exit
 
 function checkRegisterRate(ip: string): boolean {
   const now = Date.now();
@@ -127,7 +158,7 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     res.status(429).json({ ok: false, error: 'Too many registration attempts. Try again later.' });
     return;
   }
-  const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit, audit } = req.body as Record<string, unknown>;
+  const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit } = req.body as Record<string, unknown>;
 
   if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
     res.status(400).json({ ok: false, error: 'Missing required fields: slug, siteName, siteUrl' });
@@ -171,10 +202,9 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
       site: { name: siteName, url: siteUrl },
       rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-      // Audit is disabled — the AuditManager is a stub with no real implementation.
-      // Re-enable when a real audit backend is wired up.
       audit: false,
-    });
+      corsOrigin: CORS_ORIGINS ? CORS_ORIGINS.split(',').map(s => s.trim()) : '*',
+    } as Record<string, unknown>);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });

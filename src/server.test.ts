@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import dns from 'node:dns/promises';
 import request from 'supertest';
-import { app, isPublicUrl, isPrivateIP } from './server';
+import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl } from './server';
 
 // ─── Unit: isPrivateIP ───────────────────────────────────────────────────────
 
@@ -8,6 +9,10 @@ describe('isPrivateIP', () => {
   it('blocks loopback', () => {
     expect(isPrivateIP('127.0.0.1')).toBe(true);
     expect(isPrivateIP('127.0.0.2')).toBe(true);
+  });
+
+  it('blocks 0.0.0.0', () => {
+    expect(isPrivateIP('0.0.0.0')).toBe(true);
   });
 
   it('blocks RFC-1918 ranges', () => {
@@ -26,6 +31,16 @@ describe('isPrivateIP', () => {
     expect(isPrivateIP('fe80::1')).toBe(true);
     expect(isPrivateIP('fc00::1')).toBe(true);
     expect(isPrivateIP('fd12::1')).toBe(true);
+  });
+
+  it('blocks IPv6-mapped IPv4 private addresses', () => {
+    expect(isPrivateIP('::ffff:127.0.0.1')).toBe(true);
+    expect(isPrivateIP('::ffff:10.0.0.1')).toBe(true);
+    expect(isPrivateIP('::ffff:192.168.1.1')).toBe(true);
+  });
+
+  it('allows IPv6-mapped IPv4 public addresses', () => {
+    expect(isPrivateIP('::ffff:8.8.8.8')).toBe(false);
   });
 
   it('allows public IPs', () => {
@@ -212,5 +227,114 @@ describe('GET /:slug/.well-known/agents.json', () => {
     expect(res.status).toBe(404);
     expect(res.body.ok).toBe(false);
     expect(res.body.error).toMatch(/No agent door registered/);
+  });
+});
+
+// ─── Integration: Registration happy path ────────────────────────────────────
+
+describe('POST /register (happy path)', () => {
+  // Use a unique slug per test run to avoid 409 conflicts
+  const slug = `hp-${Date.now()}`.slice(0, 20).toLowerCase();
+
+  it('registers a site and returns gateway URLs', async () => {
+    // Mock dns.resolve4 to return public IPs for the test domain
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+
+    // Mock global fetch to return a minimal OpenAPI spec
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        openapi: '3.0.0',
+        info: { title: 'Test API', version: '1.0' },
+        paths: {
+          '/items': {
+            get: {
+              operationId: 'listItems',
+              summary: 'List items',
+              parameters: [{ name: 'q', in: 'query', schema: { type: 'string' } }],
+            },
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug,
+        siteName: 'Happy Path Store',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://api.example.com',
+        openApiUrl: 'https://api.example.com/openapi.json',
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.data.slug).toBe(slug);
+    expect(res.body.data.gateway_url).toContain(`/${slug}`);
+    expect(res.body.data.agents_json).toContain(`/${slug}/.well-known/agents.json`);
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
+  it('serves agents.json for the registered slug', async () => {
+    const res = await request(app).get(`/${slug}/.well-known/agents.json`);
+    expect(res.status).toBe(200);
+    expect(res.body.schema_version).toBe('1.0');
+    expect(res.body.site.name).toBe('Happy Path Store');
+    expect(res.body.capabilities.length).toBeGreaterThan(0);
+  });
+
+  it('serves agents.txt for the registered slug', async () => {
+    const res = await request(app).get(`/${slug}/.well-known/agents.txt`);
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('Happy Path Store');
+  });
+
+  it('rejects duplicate slug registration', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug,
+        siteName: 'Duplicate',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://api.example.com',
+        openApiUrl: 'https://api.example.com/openapi.json',
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already registered/);
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+  });
+
+  afterAll(async () => {
+    // Cleanup: delete the test registration
+    await request(app).delete(`/sites/${slug}`);
+  });
+});
+
+// ─── Integration: x-forwarded header safety ──────────────────────────────────
+
+describe('gatewayBase header safety', () => {
+  it('does not use forged x-forwarded-host in /sites response', async () => {
+    // GET /sites uses gatewayBase to build gateway_url for each site.
+    // With trust proxy not configured, x-forwarded-host should be ignored.
+    const res = await request(app)
+      .get('/sites')
+      .set('x-forwarded-host', 'evil.com')
+      .set('x-forwarded-proto', 'https');
+
+    expect(res.status).toBe(200);
+    // Even if there are registered sites, none should have evil.com in gateway_url
+    for (const site of res.body.data) {
+      expect(site.gateway_url).not.toContain('evil.com');
+    }
   });
 });

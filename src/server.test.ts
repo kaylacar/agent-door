@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import dns from 'node:dns/promises';
 import request from 'supertest';
-import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl, timingSafeEqual } from './server';
+import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl, timingSafeEqual, checkRegisterRate, registerWindow } from './server';
 
 // ─── Unit: isPrivateIP ───────────────────────────────────────────────────────
 
@@ -357,5 +357,156 @@ describe('gatewayBase header safety', () => {
     for (const site of res.body.data) {
       expect(site.gateway_url).not.toContain('evil.com');
     }
+  });
+});
+
+// ─── Unit: checkRegisterRate ──────────────────────────────────────────────────
+
+describe('checkRegisterRate', () => {
+  const testIP = `rate-test-${Date.now()}`;
+
+  afterAll(() => {
+    registerWindow.delete(testIP);
+  });
+
+  it('allows up to 10 requests then blocks', () => {
+    for (let i = 0; i < 10; i++) {
+      expect(checkRegisterRate(testIP)).toBe(true);
+    }
+    // 11th request should be blocked
+    expect(checkRegisterRate(testIP)).toBe(false);
+  });
+});
+
+// ─── Integration: rateLimit parameter validation ─────────────────────────────
+
+describe('POST /register (rateLimit validation)', () => {
+  beforeEach(() => {
+    // Clear rate limit for loopback to avoid 429 from earlier tests
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('rejects negative rateLimit', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug: 'rl-neg',
+        siteName: 'Test',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://example.com',
+        rateLimit: -1,
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/rateLimit must be/);
+  });
+
+  it('rejects Infinity rateLimit', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug: 'rl-inf',
+        siteName: 'Test',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://example.com',
+        rateLimit: Infinity,
+      });
+    // Infinity serializes to null in JSON, so it'll be a non-number
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects rateLimit over 1000', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug: 'rl-big',
+        siteName: 'Test',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://example.com',
+        rateLimit: 9999,
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/rateLimit must be/);
+  });
+
+  it('rejects string rateLimit', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({
+        slug: 'rl-str',
+        siteName: 'Test',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://example.com',
+        rateLimit: 'fast',
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/rateLimit must be/);
+  });
+});
+
+// ─── Integration: oversized request body ─────────────────────────────────────
+
+describe('POST /register (oversized body)', () => {
+  it('rejects body larger than 50KB', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ slug: 'big', siteName: 'x'.repeat(60_000), siteUrl: 'https://example.com', apiUrl: 'https://example.com' });
+    expect(res.status).toBe(413);
+  });
+});
+
+// ─── Integration: session lifecycle via registered door ──────────────────────
+
+describe('Session lifecycle', () => {
+  const slug = `sess-${Date.now()}`.slice(0, 20).toLowerCase();
+
+  beforeEach(() => {
+    // Clear rate limit for this test's IP to avoid 429 from earlier tests
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('can create and end a session through the gateway', async () => {
+    // Register a site first
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        openapi: '3.0.0',
+        info: { title: 'Session Test', version: '1.0' },
+        paths: { '/items': { get: { operationId: 'listItems', summary: 'List' } } },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const regRes = await request(app).post('/register').send({
+      slug,
+      siteName: 'Session Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+    expect(regRes.status).toBe(200);
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+
+    // Create a session
+    const sessionRes = await request(app).post(`/${slug}/.well-known/agents/api/session`);
+    expect(sessionRes.status).toBe(200);
+    expect(sessionRes.body.ok).toBe(true);
+    expect(sessionRes.body.data.session_token).toBeDefined();
+    expect(sessionRes.body.data.expires_at).toBeDefined();
+
+    // End the session
+    const endRes = await request(app)
+      .delete(`/${slug}/.well-known/agents/api/session`)
+      .set('Authorization', `Bearer ${sessionRes.body.data.session_token}`);
+    expect(endRes.status).toBe(200);
+    expect(endRes.body.ok).toBe(true);
+  });
+
+  afterAll(async () => {
+    await request(app).delete(`/sites/${slug}`);
   });
 });

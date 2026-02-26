@@ -3,12 +3,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.app = void 0;
+exports.registerWindow = exports.app = void 0;
 exports.startServer = startServer;
 exports.isPublicUrl = isPublicUrl;
 exports.resolveAndValidateUrl = resolveAndValidateUrl;
 exports.isPrivateIP = isPrivateIP;
 exports.timingSafeEqual = timingSafeEqual;
+exports.checkRegisterRate = checkRegisterRate;
 const node_crypto_1 = __importDefault(require("node:crypto"));
 const promises_1 = __importDefault(require("node:dns/promises"));
 const node_net_1 = __importDefault(require("node:net"));
@@ -25,6 +26,7 @@ if (TRUSTED_PROXY) {
 app.use(express_1.default.json({ limit: '50kb' }));
 const registry = new registry_1.Registry();
 const doors = new Map();
+const doorMiddlewares = new Map();
 const slugPatterns = new Map();
 // ─── URL validation (SSRF protection) ────────────────────────────────────────
 const BLOCKED_HOSTNAMES = new Set([
@@ -98,6 +100,7 @@ async function resolveAndValidateUrl(raw) {
     }
 }
 const FETCH_TIMEOUT_MS = 10_000;
+const MAX_SPEC_BYTES = 5 * 1024 * 1024; // 5 MB cap on OpenAPI spec response
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 const ADMIN_KEY = process.env.ADMIN_KEY;
 function timingSafeEqual(a, b) {
@@ -137,6 +140,7 @@ app.get('/', (_req, res) => {
 });
 // ─── Registration rate limiting ───────────────────────────────────────────────
 const registerWindow = new Map();
+exports.registerWindow = registerWindow;
 const REGISTER_LIMIT = 10; // max registrations per IP per window
 const REGISTER_WINDOW_MS = 60_000;
 // Periodic cleanup to prevent unbounded memory growth from stale IPs
@@ -187,6 +191,10 @@ app.post('/register', requireAdmin, async (req, res) => {
         res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
         return;
     }
+    if (typeof rateLimit !== 'undefined' && (typeof rateLimit !== 'number' || !Number.isFinite(rateLimit) || rateLimit < 1 || rateLimit > 1000)) {
+        res.status(400).json({ ok: false, error: 'rateLimit must be a number between 1 and 1000' });
+        return;
+    }
     if (doors.has(slug)) {
         res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
         return;
@@ -210,7 +218,10 @@ app.post('/register', requireAdmin, async (req, res) => {
         const specRes = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!specRes.ok)
             throw new Error(`HTTP ${specRes.status} fetching spec`);
-        const spec = await specRes.json();
+        const specText = await specRes.text();
+        if (specText.length > MAX_SPEC_BYTES)
+            throw new Error(`Spec exceeds ${MAX_SPEC_BYTES} byte limit`);
+        const spec = JSON.parse(specText);
         door = sdk_1.AgentDoor.fromOpenAPI(spec, resolvedApiUrl, {
             site: { name: siteName, url: siteUrl },
             rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
@@ -234,6 +245,7 @@ app.post('/register', requireAdmin, async (req, res) => {
     };
     registry.register(reg);
     doors.set(slug, door);
+    doorMiddlewares.set(slug, door.middleware());
     slugPatterns.set(slug, new RegExp(`^/${escapeRegExp(slug)}`));
     const base = gatewayBase(req);
     res.json({
@@ -268,6 +280,7 @@ app.delete('/sites/:slug', requireAdmin, (req, res) => {
     }
     door.destroy();
     doors.delete(slug);
+    doorMiddlewares.delete(slug);
     slugPatterns.delete(slug);
     registry.delete(slug);
     res.json({ ok: true, data: { slug, deleted: true } });
@@ -278,8 +291,8 @@ function escapeRegExp(s) {
 }
 app.use('/:slug', (req, res, next) => {
     const { slug } = req.params;
-    const door = doors.get(slug);
-    if (!door) {
+    const mw = doorMiddlewares.get(slug);
+    if (!mw) {
         res.status(404).json({ ok: false, error: `No agent door registered for '${slug}'` });
         return;
     }
@@ -287,7 +300,7 @@ app.use('/:slug', (req, res, next) => {
     const original = req.url;
     const pattern = slugPatterns.get(slug);
     req.url = original.replace(pattern, '') || '/';
-    door.middleware()(req, res, () => {
+    mw(req, res, () => {
         // Restore URL if the door didn't handle it
         req.url = original;
         next();
@@ -310,6 +323,7 @@ function startServer() {
             door.destroy();
         }
         doors.clear();
+        doorMiddlewares.clear();
         server.close(() => {
             process.exit(0);
         });

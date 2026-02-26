@@ -17,6 +17,7 @@ app.use(express.json({ limit: '50kb' }));
 
 const registry = new Registry();
 const doors = new Map<string, AgentDoor>();
+const doorMiddlewares = new Map<string, ReturnType<AgentDoor['middleware']>>();
 const slugPatterns = new Map<string, RegExp>();
 
 // ─── URL validation (SSRF protection) ────────────────────────────────────────
@@ -83,6 +84,7 @@ async function resolveAndValidateUrl(raw: string): Promise<boolean> {
 }
 
 const FETCH_TIMEOUT_MS = 10_000;
+const MAX_SPEC_BYTES = 5 * 1024 * 1024; // 5 MB cap on OpenAPI spec response
 
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 
@@ -185,6 +187,10 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
     return;
   }
+  if (typeof rateLimit !== 'undefined' && (typeof rateLimit !== 'number' || !Number.isFinite(rateLimit) || rateLimit < 1 || rateLimit > 1000)) {
+    res.status(400).json({ ok: false, error: 'rateLimit must be a number between 1 and 1000' });
+    return;
+  }
   if (doors.has(slug)) {
     res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
     return;
@@ -211,7 +217,9 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
   try {
     const specRes = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
-    const spec = await specRes.json();
+    const specText = await specRes.text();
+    if (specText.length > MAX_SPEC_BYTES) throw new Error(`Spec exceeds ${MAX_SPEC_BYTES} byte limit`);
+    const spec = JSON.parse(specText);
     door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
       site: { name: siteName, url: siteUrl },
       rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
@@ -236,6 +244,7 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
 
   registry.register(reg);
   doors.set(slug, door);
+  doorMiddlewares.set(slug, door.middleware());
   slugPatterns.set(slug, new RegExp(`^/${escapeRegExp(slug)}`));
 
   const base = gatewayBase(req);
@@ -275,6 +284,7 @@ app.delete('/sites/:slug', requireAdmin, (req: Request, res: Response) => {
   }
   door.destroy();
   doors.delete(slug);
+  doorMiddlewares.delete(slug);
   slugPatterns.delete(slug);
   registry.delete(slug);
   res.json({ ok: true, data: { slug, deleted: true } });
@@ -288,8 +298,8 @@ function escapeRegExp(s: string): string {
 
 app.use('/:slug', (req, res, next) => {
   const { slug } = req.params;
-  const door = doors.get(slug);
-  if (!door) {
+  const mw = doorMiddlewares.get(slug);
+  if (!mw) {
     res.status(404).json({ ok: false, error: `No agent door registered for '${slug}'` });
     return;
   }
@@ -299,7 +309,7 @@ app.use('/:slug', (req, res, next) => {
   const pattern = slugPatterns.get(slug)!;
   req.url = original.replace(pattern, '') || '/';
 
-  door.middleware()(req, res, () => {
+  mw(req, res, () => {
     // Restore URL if the door didn't handle it
     req.url = original;
     next();
@@ -326,6 +336,7 @@ function startServer() {
       door.destroy();
     }
     doors.clear();
+    doorMiddlewares.clear();
     server.close(() => {
       process.exit(0);
     });
@@ -342,4 +353,4 @@ if (require.main === module) {
   startServer();
 }
 
-export { app, startServer, isPublicUrl, resolveAndValidateUrl, isPrivateIP, timingSafeEqual };
+export { app, startServer, isPublicUrl, resolveAndValidateUrl, isPrivateIP, timingSafeEqual, checkRegisterRate, registerWindow };

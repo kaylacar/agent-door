@@ -8,6 +8,7 @@ const rate_limiter_1 = require("./rate-limiter");
 const audit_1 = require("./audit");
 const AGENTS_REL = 'agents';
 const PROXY_TIMEOUT_MS = 15000;
+const MAX_PROXY_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB cap on upstream responses
 class AgentDoor {
     config;
     basePath;
@@ -106,7 +107,13 @@ class AgentDoor {
                             err.upstreamStatus = response.status;
                             throw err;
                         }
-                        return response.json();
+                        const responseText = await response.text();
+                        if (responseText.length > MAX_PROXY_RESPONSE_BYTES) {
+                            const err = new Error(`Upstream response exceeds ${MAX_PROXY_RESPONSE_BYTES} byte limit`);
+                            err.upstreamStatus = 502;
+                            throw err;
+                        }
+                        return JSON.parse(responseText);
                     },
                 });
             }

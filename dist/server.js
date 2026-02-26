@@ -4,6 +4,12 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.app = void 0;
+exports.startServer = startServer;
+exports.isPublicUrl = isPublicUrl;
+exports.resolveAndValidateUrl = resolveAndValidateUrl;
+exports.isPrivateIP = isPrivateIP;
+const promises_1 = __importDefault(require("node:dns/promises"));
+const node_net_1 = __importDefault(require("node:net"));
 const express_1 = __importDefault(require("express"));
 const sdk_1 = require("@agents-protocol/sdk");
 const registry_1 = require("./registry");
@@ -20,6 +26,19 @@ const BLOCKED_HOSTNAMES = new Set([
     '[::1]',
     'metadata.google.internal',
 ]);
+const PRIVATE_IP_RE = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|127\.)/;
+function isPrivateIP(ip) {
+    if (BLOCKED_HOSTNAMES.has(ip))
+        return true;
+    if (PRIVATE_IP_RE.test(ip))
+        return true;
+    if (node_net_1.default.isIPv6(ip)) {
+        const normalized = ip.toLowerCase();
+        if (normalized === '::1' || normalized.startsWith('fe80:') || normalized.startsWith('fc00:') || normalized.startsWith('fd'))
+            return true;
+    }
+    return false;
+}
 function isPublicUrl(raw) {
     let parsed;
     try {
@@ -32,11 +51,33 @@ function isPublicUrl(raw) {
         return false;
     if (BLOCKED_HOSTNAMES.has(parsed.hostname))
         return false;
-    // Block link-local, loopback, and AWS metadata IPs
-    if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|127\.)/.test(parsed.hostname))
+    if (PRIVATE_IP_RE.test(parsed.hostname))
         return false;
     return true;
 }
+async function resolveAndValidateUrl(raw) {
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    }
+    catch {
+        return false;
+    }
+    if (!isPublicUrl(raw))
+        return false;
+    // If it's already an IP, check directly
+    if (node_net_1.default.isIP(parsed.hostname))
+        return !isPrivateIP(parsed.hostname);
+    // Resolve DNS to catch rebinding attacks
+    try {
+        const addresses = await promises_1.default.resolve4(parsed.hostname);
+        return addresses.every(ip => !isPrivateIP(ip));
+    }
+    catch {
+        return false;
+    }
+}
+const FETCH_TIMEOUT_MS = 10_000;
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 const ADMIN_KEY = process.env.ADMIN_KEY;
 function requireAdmin(req, res, next) {
@@ -62,8 +103,31 @@ function gatewayBase(req) {
 app.get('/', (_req, res) => {
     res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
 });
+// ─── Registration rate limiting ───────────────────────────────────────────────
+const registerWindow = new Map();
+const REGISTER_LIMIT = 10; // max registrations per IP per window
+const REGISTER_WINDOW_MS = 60_000;
+function checkRegisterRate(ip) {
+    const now = Date.now();
+    const cutoff = now - REGISTER_WINDOW_MS;
+    let timestamps = registerWindow.get(ip);
+    if (!timestamps) {
+        timestamps = [];
+        registerWindow.set(ip, timestamps);
+    }
+    const recent = timestamps.filter(t => t > cutoff);
+    registerWindow.set(ip, recent);
+    if (recent.length >= REGISTER_LIMIT)
+        return false;
+    recent.push(now);
+    return true;
+}
 // ─── Registration ─────────────────────────────────────────────────────────────
 app.post('/register', requireAdmin, async (req, res) => {
+    if (!checkRegisterRate(req.ip ?? req.socket?.remoteAddress ?? 'unknown')) {
+        res.status(429).json({ ok: false, error: 'Too many registration attempts. Try again later.' });
+        return;
+    }
     const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit, audit } = req.body;
     if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
         res.status(400).json({ ok: false, error: 'Missing required fields: slug, siteName, siteUrl' });
@@ -81,30 +145,32 @@ app.post('/register', requireAdmin, async (req, res) => {
         res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
         return;
     }
-    // Validate URLs against SSRF
+    // Validate URLs against SSRF (with DNS resolution to prevent rebinding)
     const urlsToCheck = [siteUrl, ...(typeof apiUrl === 'string' ? [apiUrl] : []), ...(typeof openApiUrl === 'string' ? [openApiUrl] : [])];
     for (const u of urlsToCheck) {
-        if (!isPublicUrl(u)) {
+        if (!(await resolveAndValidateUrl(u))) {
             res.status(400).json({ ok: false, error: `URL not allowed: ${u}` });
             return;
         }
     }
     const resolvedApiUrl = (typeof apiUrl === 'string' ? apiUrl : siteUrl).replace(/\/$/, '');
     const specUrl = typeof openApiUrl === 'string' ? openApiUrl : `${resolvedApiUrl}/openapi.json`;
-    if (!isPublicUrl(specUrl)) {
+    if (!(await resolveAndValidateUrl(specUrl))) {
         res.status(400).json({ ok: false, error: `Spec URL not allowed: ${specUrl}` });
         return;
     }
     let door;
     try {
-        const specRes = await fetch(specUrl);
+        const specRes = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!specRes.ok)
             throw new Error(`HTTP ${specRes.status} fetching spec`);
         const spec = await specRes.json();
         door = sdk_1.AgentDoor.fromOpenAPI(spec, resolvedApiUrl, {
             site: { name: siteName, url: siteUrl },
             rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-            audit: audit === true,
+            // Audit is disabled — the AuditManager is a stub with no real implementation.
+            // Re-enable when a real audit backend is wired up.
+            audit: false,
         });
     }
     catch (err) {
@@ -119,7 +185,7 @@ app.post('/register', requireAdmin, async (req, res) => {
         apiUrl: resolvedApiUrl,
         openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
         rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-        audit: audit === true,
+        audit: false,
         createdAt: new Date(),
     };
     registry.register(reg);
@@ -181,25 +247,32 @@ app.use('/:slug', (req, res, next) => {
     });
 });
 // ─── Start ────────────────────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT ?? '3000', 10);
-const server = app.listen(PORT, () => {
-    console.log(`Agent Door gateway running on port ${PORT}`);
-    console.log(`Register a site: POST http://localhost:${PORT}/register`);
-    if (!ADMIN_KEY) {
-        console.log('WARNING: No ADMIN_KEY set — admin endpoints are unprotected');
-    }
-});
-// ─── Graceful shutdown ────────────────────────────────────────────────────────
-function shutdown() {
-    console.log('Shutting down...');
-    for (const [slug, door] of doors) {
-        door.destroy();
-        doors.delete(slug);
-    }
-    server.close(() => {
-        process.exit(0);
+function startServer() {
+    const PORT = parseInt(process.env.PORT ?? '3000', 10);
+    const server = app.listen(PORT, () => {
+        console.log(`Agent Door gateway running on port ${PORT}`);
+        console.log(`Register a site: POST http://localhost:${PORT}/register`);
+        if (!ADMIN_KEY) {
+            console.log('WARNING: No ADMIN_KEY set — admin endpoints are unprotected');
+        }
     });
+    // ─── Graceful shutdown ──────────────────────────────────────────────────────
+    function shutdown() {
+        console.log('Shutting down...');
+        for (const [, door] of doors) {
+            door.destroy();
+        }
+        doors.clear();
+        server.close(() => {
+            process.exit(0);
+        });
+    }
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    return server;
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+// Auto-start when run directly (not imported for tests)
+if (require.main === module) {
+    startServer();
+}
 //# sourceMappingURL=server.js.map

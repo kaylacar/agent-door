@@ -19,7 +19,7 @@ function generateAgentsTxt(config) {
     if (config.site.contact)
         lines.push(`Contact: ${config.site.contact}`);
     lines.push('');
-    lines.push(`Agents-JSON: ${config.site.url}${basePath}/agents.json`);
+    lines.push(`Agents-JSON: ${basePath}/agents.json`);
     lines.push('');
     lines.push('# Capabilities');
     for (const cap of capabilities) {
@@ -42,7 +42,7 @@ function generateAgentsTxt(config) {
         lines.push(`Session-TTL: ${config.sessionTtl}s`);
     if (config.audit) {
         lines.push(`Audit: true`);
-        lines.push(`Audit-Endpoint: ${config.site.url}${basePath}/agents/api/audit/:session_id`);
+        lines.push(`Audit-Endpoint: ${basePath}/agents/api/audit/:session_id`);
     }
     lines.push('');
     return lines.join('\n');

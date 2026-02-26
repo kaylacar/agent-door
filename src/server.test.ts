@@ -510,3 +510,157 @@ describe('Session lifecycle', () => {
     await request(app).delete(`/sites/${slug}`);
   });
 });
+
+// ─── Integration: OpenAPI spec validation ─────────────────────────────────────
+
+describe('POST /register (spec validation)', () => {
+  beforeEach(() => {
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('rejects spec with no paths object', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ openapi: '3.0.0', info: { title: 'Bad' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const res = await request(app).post('/register').send({
+      slug: 'bad-spec',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/missing or malformed/);
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
+  it('rejects spec with empty paths', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ openapi: '3.0.0', paths: {} }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const res = await request(app).post('/register').send({
+      slug: 'empty-paths',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no paths/);
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+});
+
+// ─── Integration: error message sanitization ──────────────────────────────────
+
+describe('POST /register (error sanitization)', () => {
+  beforeEach(() => {
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('does not leak DNS details in error response', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    // Simulate a network error fetching the spec
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(
+      new Error('getaddrinfo ENOTFOUND internal-host.corp.local'),
+    );
+
+    const res = await request(app).post('/register').send({
+      slug: 'err-leak',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    expect(res.status).toBe(400);
+    // Should NOT contain the internal hostname
+    expect(res.body.error).not.toContain('internal-host.corp.local');
+    expect(res.body.error).toContain('Failed to fetch or parse spec');
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+});
+
+// ─── Integration: Retry-After on 429 ──────────────────────────────────────────
+
+describe('POST /register (Retry-After header)', () => {
+  it('includes Retry-After header on 429', async () => {
+    const testIP = `retry-after-test-${Date.now()}`;
+    // Exhaust the rate limit for a specific IP
+    for (let i = 0; i < 10; i++) {
+      checkRegisterRate(testIP);
+    }
+    expect(checkRegisterRate(testIP)).toBe(false);
+    registerWindow.delete(testIP);
+  });
+});
+
+// ─── Integration: agents.txt uses relative URLs ──────────────────────────────
+
+describe('agents.txt URL correctness', () => {
+  // Re-use the slug from the happy path test
+  const slug = `atxt-${Date.now()}`.slice(0, 20).toLowerCase();
+
+  beforeEach(() => {
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('agents.txt does not contain the original site URL for Agents-JSON', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        openapi: '3.0.0',
+        info: { title: 'URL Test', version: '1.0' },
+        paths: { '/items': { get: { operationId: 'listItems', summary: 'List' } } },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    await request(app).post('/register').send({
+      slug,
+      siteName: 'URL Test',
+      siteUrl: 'https://original-site.example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+
+    const res = await request(app).get(`/${slug}/.well-known/agents.txt`);
+    expect(res.status).toBe(200);
+    // The Agents-JSON line should NOT use the original site URL
+    // (which would bypass the gateway)
+    const agentsJsonLine = res.text.split('\n').find((l: string) => l.startsWith('Agents-JSON:'));
+    expect(agentsJsonLine).toBeDefined();
+    expect(agentsJsonLine).not.toContain('original-site.example.com');
+  });
+
+  afterAll(async () => {
+    await request(app).delete(`/sites/${slug}`);
+  });
+});

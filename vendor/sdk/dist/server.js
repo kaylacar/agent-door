@@ -88,7 +88,14 @@ class AgentDoor {
                         for (const [k, v] of Object.entries(req.params)) {
                             resolvedPath = resolvedPath.replace(`{${k}}`, encodeURIComponent(v));
                         }
-                        const url = new URL(`${baseUrl}${resolvedPath}`);
+                        const baseUrlObj = new URL(baseUrl);
+                        const url = new URL(`${baseUrlObj.origin}${baseUrlObj.pathname.replace(/\/$/, '')}${resolvedPath}`);
+                        // Verify the constructed URL didn't change origin (prevents SSRF via path manipulation)
+                        if (url.origin !== baseUrlObj.origin) {
+                            const err = new Error('Proxy URL origin mismatch');
+                            err.upstreamStatus = 502;
+                            throw err;
+                        }
                         if (method === 'GET' || method === 'DELETE') {
                             for (const [k, v] of Object.entries(req.query)) {
                                 url.searchParams.set(k, v);
@@ -113,7 +120,13 @@ class AgentDoor {
                             err.upstreamStatus = 502;
                             throw err;
                         }
-                        return JSON.parse(responseText);
+                        try {
+                            return JSON.parse(responseText);
+                        } catch {
+                            const err = new Error('Upstream returned invalid JSON');
+                            err.upstreamStatus = 502;
+                            throw err;
+                        }
                     },
                 });
             }
@@ -156,6 +169,9 @@ class AgentDoor {
                 return;
             }
             res.status(result.status);
+            if (result.status === 429) {
+                res.setHeader('Retry-After', '60');
+            }
             if (result.contentType) {
                 res.type(result.contentType).send(result.body);
             }
@@ -191,6 +207,7 @@ class AgentDoor {
             const headers = {
                 ...cors,
                 'Content-Type': result.contentType ?? 'application/json',
+                ...(result.status === 429 ? { 'Retry-After': '60' } : {}),
             };
             const body = result.contentType
                 ? String(result.body)

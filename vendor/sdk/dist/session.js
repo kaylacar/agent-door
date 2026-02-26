@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionManager = void 0;
 const uuid_1 = require("uuid");
+const MAX_SESSIONS = 10000; // hard cap on concurrent sessions per door
 class SessionManager {
     sessions = new Map();
     cleanupInterval;
@@ -13,6 +14,9 @@ class SessionManager {
     }
     capabilityNames;
     createSession(siteId) {
+        if (this.sessions.size >= MAX_SESSIONS) {
+            throw new Error('Maximum concurrent sessions reached');
+        }
         const sessionToken = (0, uuid_1.v4)();
         const expiresAt = new Date(Date.now() + this.ttl * 1000);
         const session = {

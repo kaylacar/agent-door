@@ -85,10 +85,12 @@ async function resolveAndValidateUrl(raw: string): Promise<boolean> {
 
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_SPEC_BYTES = 5 * 1024 * 1024; // 5 MB cap on OpenAPI spec response
+const MAX_SPEC_PATHS = 100; // cap on number of OpenAPI paths to prevent resource exhaustion
+const MAX_REGISTRATIONS = 500; // hard cap on total registered sites
 
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 
-const ADMIN_KEY = process.env.ADMIN_KEY;
+const ADMIN_KEY = process.env.ADMIN_KEY || undefined; // treat '' as unset
 
 function timingSafeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
@@ -170,7 +172,7 @@ function checkRegisterRate(ip: string): boolean {
 
 app.post('/register', requireAdmin, async (req: Request, res: Response) => {
   if (!checkRegisterRate(req.ip ?? req.socket?.remoteAddress ?? 'unknown')) {
-    res.status(429).json({ ok: false, error: 'Too many registration attempts. Try again later.' });
+    res.set('Retry-After', '60').status(429).json({ ok: false, error: 'Too many registration attempts. Try again later.' });
     return;
   }
   const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit } = req.body as Record<string, unknown>;
@@ -189,6 +191,10 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
   }
   if (typeof rateLimit !== 'undefined' && (typeof rateLimit !== 'number' || !Number.isFinite(rateLimit) || rateLimit < 1 || rateLimit > 1000)) {
     res.status(400).json({ ok: false, error: 'rateLimit must be a number between 1 and 1000' });
+    return;
+  }
+  if (doors.size >= MAX_REGISTRATIONS) {
+    res.status(503).json({ ok: false, error: 'Maximum number of registrations reached' });
     return;
   }
   if (doors.has(slug)) {
@@ -220,6 +226,13 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     const specText = await specRes.text();
     if (specText.length > MAX_SPEC_BYTES) throw new Error(`Spec exceeds ${MAX_SPEC_BYTES} byte limit`);
     const spec = JSON.parse(specText);
+    // Validate spec structure before creating capabilities
+    if (!spec || typeof spec !== 'object' || !spec.paths || typeof spec.paths !== 'object' || Array.isArray(spec.paths)) {
+      throw new Error('Invalid OpenAPI spec: missing or malformed "paths" object');
+    }
+    const pathCount = Object.keys(spec.paths).length;
+    if (pathCount === 0) throw new Error('OpenAPI spec has no paths');
+    if (pathCount > MAX_SPEC_PATHS) throw new Error(`OpenAPI spec has ${pathCount} paths, max is ${MAX_SPEC_PATHS}`);
     door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
       site: { name: siteName, url: siteUrl },
       rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
@@ -228,7 +241,13 @@ app.post('/register', requireAdmin, async (req: Request, res: Response) => {
     } as Record<string, unknown>);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });
+    // Sanitize: only expose safe error details, not internal DNS/network info
+    const safeMessage = message.startsWith('Invalid OpenAPI spec') || message.startsWith('OpenAPI spec has')
+      ? message
+      : message.startsWith('HTTP ') || message.startsWith('Spec exceeds')
+        ? message
+        : 'Failed to fetch or parse spec';
+    res.status(400).json({ ok: false, error: `Could not load OpenAPI spec: ${safeMessage}` });
     return;
   }
 

@@ -20,6 +20,7 @@ export class Registry {
     }
     this.db = new Database(resolvedPath);
     this.db.pragma('journal_mode = WAL');
+    this.db.pragma('busy_timeout = 5000');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS registrations (
         slug         TEXT PRIMARY KEY,
@@ -80,7 +81,19 @@ export class Registry {
     return result.changes > 0;
   }
 
+  healthy(): boolean {
+    try {
+      this.db.prepare('SELECT 1').get();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   close(): void {
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch { /* best-effort flush before close */ }
     this.db.close();
   }
 

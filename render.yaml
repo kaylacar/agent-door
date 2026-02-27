@@ -4,5 +4,17 @@ services:
     runtime: node
     buildCommand: npm install --production
     startCommand: node dist/server.js
-    plan: free
+    plan: starter
     autoDeploy: true
+    healthCheckPath: /
+    disk:
+      name: agent-door-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /data/agent-door.db
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_KEY
+        generateValue: true

@@ -8,6 +8,7 @@ export declare class Registry {
     list(): SiteRegistration[];
     listWithSpecs(): SiteRegistrationWithSpec[];
     delete(slug: string): boolean;
+    healthy(): boolean;
     close(): void;
     private rowToRegistration;
 }

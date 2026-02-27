@@ -124,14 +124,12 @@ describe('isPublicUrl', () => {
 // ─── Integration: Health check ───────────────────────────────────────────────
 
 describe('GET /', () => {
-  it('returns ok with service info', async () => {
+  it('returns ok with service info and DB status', async () => {
     const res = await request(app).get('/');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({
-      ok: true,
-      service: 'Agent Door Gateway',
-      version: '0.1.0',
-    });
+    expect(res.body.ok).toBe(true);
+    expect(res.body.service).toBe('Agent Door Gateway');
+    expect(res.body.version).toBe('0.1.0');
   });
 });
 
@@ -773,5 +771,87 @@ describe('Registry persistence', () => {
     // Should not have specJson on regular list
     expect((items[0] as Record<string, unknown>).specJson).toBeUndefined();
     reg.close();
+  });
+
+  it('healthy() returns true for a working database', () => {
+    const reg = new Registry(':memory:');
+    expect(reg.healthy()).toBe(true);
+    reg.close();
+  });
+});
+
+// ─── Integration: spec fetch rejects redirects (SSRF bypass) ─────────────────
+
+describe('POST /register (redirect SSRF protection)', () => {
+  beforeEach(() => {
+    registerWindow.delete('::ffff:127.0.0.1');
+    registerWindow.delete('127.0.0.1');
+  });
+
+  it('rejects spec URL that returns a redirect', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    // Mock fetch to return a 301 redirect to an internal IP
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, {
+        status: 301,
+        headers: { 'Location': 'http://169.254.169.254/latest/meta-data' },
+      }),
+    );
+
+    const res = await request(app).post('/register').send({
+      slug: 'redir-ssrf',
+      siteName: 'Redirect Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('Redirects are not allowed');
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
+  it('rejects 302 redirects as well', async () => {
+    const resolve4Spy = vi.spyOn(dns, 'resolve4').mockResolvedValue(['93.184.216.34']);
+    const resolve6Spy = vi.spyOn(dns, 'resolve6').mockRejectedValue(new Error('no AAAA'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { 'Location': 'http://localhost:8080/secret' },
+      }),
+    );
+
+    const res = await request(app).post('/register').send({
+      slug: 'redir-302',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      openApiUrl: 'https://api.example.com/openapi.json',
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('Redirects are not allowed');
+
+    resolve4Spy.mockRestore();
+    resolve6Spy.mockRestore();
+    fetchSpy.mockRestore();
+  });
+});
+
+// ─── Integration: security headers ──────────────────────────────────────────
+
+describe('Security headers', () => {
+  it('includes X-Content-Type-Options header', async () => {
+    const res = await request(app).get('/');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+  });
+
+  it('includes X-Frame-Options header', async () => {
+    const res = await request(app).get('/');
+    expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
   });
 });

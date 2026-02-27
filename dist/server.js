@@ -14,6 +14,7 @@ const node_crypto_1 = __importDefault(require("node:crypto"));
 const promises_1 = __importDefault(require("node:dns/promises"));
 const node_net_1 = __importDefault(require("node:net"));
 const express_1 = __importDefault(require("express"));
+const helmet_1 = __importDefault(require("helmet"));
 const sdk_1 = require("@agents-protocol/sdk");
 const registry_1 = require("./registry");
 const CORS_ORIGINS = process.env.CORS_ORIGINS; // comma-separated allowlist, or unset for '*'
@@ -215,12 +216,26 @@ function createApp(options = {}) {
     if (TRUSTED_PROXY) {
         app.set('trust proxy', TRUSTED_PROXY);
     }
+    app.use((0, helmet_1.default)());
     app.use(express_1.default.json({ limit: '50kb' }));
+    // Request logging
+    app.use((req, res, next) => {
+        const start = Date.now();
+        res.on('finish', () => {
+            console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+        });
+        next();
+    });
     // Rebuild persisted doors
     rebuildDoors(registry, doors, doorMiddlewares, slugPatterns);
     // ─── Health check ───────────────────────────────────────────────────────────
     app.get('/', (_req, res) => {
-        res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
+        const dbOk = registry.healthy();
+        res.status(dbOk ? 200 : 503).json({
+            ok: dbOk,
+            service: 'Agent Door Gateway',
+            version: '0.1.0',
+        });
     });
     // ─── Registration ───────────────────────────────────────────────────────────
     app.post('/register', requireAdmin, async (req, res) => {
@@ -270,7 +285,13 @@ function createApp(options = {}) {
         let door;
         let specText;
         try {
-            const specRes = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+            const specRes = await fetch(specUrl, {
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+                redirect: 'manual', // Never follow redirects — prevents SSRF bypass via redirect to internal IPs
+            });
+            if (specRes.status >= 300 && specRes.status < 400) {
+                throw new Error('Redirects are not allowed when fetching OpenAPI specs');
+            }
             if (!specRes.ok)
                 throw new Error(`HTTP ${specRes.status} fetching spec`);
             const contentLength = specRes.headers.get('content-length');
@@ -302,7 +323,7 @@ function createApp(options = {}) {
             // Sanitize: only expose safe error details, not internal DNS/network info
             const safeMessage = message.startsWith('Invalid OpenAPI spec') || message.startsWith('OpenAPI spec has')
                 ? message
-                : message.startsWith('HTTP ') || message.startsWith('Spec exceeds')
+                : message.startsWith('HTTP ') || message.startsWith('Spec exceeds') || message.startsWith('Redirects are not allowed')
                     ? message
                     : 'Failed to fetch or parse spec';
             res.status(400).json({ ok: false, error: `Could not load OpenAPI spec: ${safeMessage}` });
@@ -317,7 +338,21 @@ function createApp(options = {}) {
             rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
             createdAt: new Date(),
         };
-        registry.register(reg, specText);
+        try {
+            registry.register(reg, specText);
+        }
+        catch (dbErr) {
+            door.destroy();
+            const code = dbErr.code;
+            if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+                res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
+            }
+            else {
+                console.error('Failed to persist registration:', dbErr);
+                res.status(500).json({ ok: false, error: 'Failed to save registration' });
+            }
+            return;
+        }
         doors.set(slug, door);
         doorMiddlewares.set(slug, door.middleware());
         slugPatterns.set(slug, new RegExp(`^/${escapeRegExp(slug)}`));
@@ -388,8 +423,17 @@ function createApp(options = {}) {
             }
         });
         // ─── Graceful shutdown ────────────────────────────────────────────────────
+        let shuttingDown = false;
         function shutdown() {
+            if (shuttingDown)
+                return;
+            shuttingDown = true;
             console.log('Shutting down...');
+            const forceExit = setTimeout(() => {
+                console.error('Shutdown timeout, forcing exit');
+                process.exit(1);
+            }, 5000);
+            forceExit.unref();
             for (const [, door] of doors) {
                 door.destroy();
             }
@@ -402,6 +446,14 @@ function createApp(options = {}) {
         }
         process.on('SIGTERM', shutdown);
         process.on('SIGINT', shutdown);
+        process.on('uncaughtException', (err) => {
+            console.error('Uncaught exception:', err);
+            shutdown();
+        });
+        process.on('unhandledRejection', (reason) => {
+            console.error('Unhandled rejection:', reason);
+            shutdown();
+        });
         return server;
     }
     return { app, registry, startServer };

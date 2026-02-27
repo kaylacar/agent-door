@@ -17,6 +17,7 @@ class Registry {
         }
         this.db = new better_sqlite3_1.default(resolvedPath);
         this.db.pragma('journal_mode = WAL');
+        this.db.pragma('busy_timeout = 5000');
         this.db.exec(`
       CREATE TABLE IF NOT EXISTS registrations (
         slug         TEXT PRIMARY KEY,
@@ -71,7 +72,20 @@ class Registry {
         const result = this.stmts.deleteBySlug.run(slug);
         return result.changes > 0;
     }
+    healthy() {
+        try {
+            this.db.prepare('SELECT 1').get();
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
     close() {
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
+        }
+        catch { /* best-effort flush before close */ }
         this.db.close();
     }
     rowToRegistration(row) {

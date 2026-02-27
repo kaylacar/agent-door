@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import dns from 'node:dns/promises';
+import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import request from 'supertest';
-import { app, isPublicUrl, isPrivateIP, resolveAndValidateUrl, timingSafeEqual, checkRegisterRate, registerWindow } from './server';
+import { createApp, isPublicUrl, isPrivateIP, resolveAndValidateUrl, timingSafeEqual, checkRegisterRate, registerWindow } from './server';
+import { Registry } from './registry';
+
+const { app } = createApp({ dbPath: ':memory:' });
 
 // ─── Unit: isPrivateIP ───────────────────────────────────────────────────────
 
@@ -662,5 +668,86 @@ describe('agents.txt URL correctness', () => {
 
   afterAll(async () => {
     await request(app).delete(`/sites/${slug}`);
+  });
+});
+
+// ─── Unit: Registry persistence ───────────────────────────────────────────────
+
+describe('Registry persistence', () => {
+  it('persists registrations across instances', () => {
+    const tmpFile = path.join(os.tmpdir(), `agent-door-test-${Date.now()}.db`);
+    try {
+      const reg1 = new Registry(tmpFile);
+      reg1.register({
+        slug: 'persist-test',
+        siteName: 'Test',
+        siteUrl: 'https://example.com',
+        apiUrl: 'https://api.example.com',
+        rateLimit: 60,
+        createdAt: new Date(),
+      }, '{"openapi":"3.0.0","paths":{"/items":{"get":{}}}}');
+      reg1.close();
+
+      const reg2 = new Registry(tmpFile);
+      const found = reg2.get('persist-test');
+      expect(found).not.toBeNull();
+      expect(found!.slug).toBe('persist-test');
+      expect(found!.siteName).toBe('Test');
+      reg2.close();
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
+  });
+
+  it('listWithSpecs returns spec JSON', () => {
+    const reg = new Registry(':memory:');
+    const spec = '{"openapi":"3.0.0","paths":{"/items":{"get":{}}}}';
+    reg.register({
+      slug: 'spec-test',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      rateLimit: 60,
+      createdAt: new Date(),
+    }, spec);
+    const rows = reg.listWithSpecs();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].specJson).toBe(spec);
+    reg.close();
+  });
+
+  it('delete removes from database and returns boolean', () => {
+    const reg = new Registry(':memory:');
+    reg.register({
+      slug: 'del-test',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      rateLimit: 60,
+      createdAt: new Date(),
+    }, '{}');
+    expect(reg.delete('del-test')).toBe(true);
+    expect(reg.get('del-test')).toBeNull();
+    expect(reg.delete('del-test')).toBe(false);
+    reg.close();
+  });
+
+  it('list excludes spec JSON', () => {
+    const reg = new Registry(':memory:');
+    reg.register({
+      slug: 'list-test',
+      siteName: 'Test',
+      siteUrl: 'https://example.com',
+      apiUrl: 'https://api.example.com',
+      rateLimit: 42,
+      createdAt: new Date(),
+    }, '{"large":"spec"}');
+    const items = reg.list();
+    expect(items).toHaveLength(1);
+    expect(items[0].slug).toBe('list-test');
+    expect(items[0].rateLimit).toBe(42);
+    // Should not have specJson on regular list
+    expect((items[0] as Record<string, unknown>).specJson).toBeUndefined();
+    reg.close();
   });
 });

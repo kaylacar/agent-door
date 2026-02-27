@@ -7,4 +7,7 @@ export interface SiteRegistration {
     rateLimit: number;
     createdAt: Date;
 }
+export interface SiteRegistrationWithSpec extends SiteRegistration {
+    specJson: string;
+}
 //# sourceMappingURL=types.d.ts.map

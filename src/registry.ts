@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname } from 'path';
 import { SiteRegistration } from './types';
 
@@ -32,7 +32,9 @@ export class Registry {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
-    writeFileSync(this.filePath, JSON.stringify([...this.sites.values()], null, 2));
+    const tmpPath = this.filePath + '.tmp';
+    writeFileSync(tmpPath, JSON.stringify([...this.sites.values()], null, 2));
+    renameSync(tmpPath, this.filePath);
   }
 
   register(reg: SiteRegistration): void {

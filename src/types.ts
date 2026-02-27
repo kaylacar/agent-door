@@ -13,6 +13,7 @@ export interface CreateAppOptions {
   registry?: import('./registry').Registry;
   apiKey?: string;
   gatewayUrl?: string;
+  corsOrigins?: string[];
   rateLimitMax?: number;
   rateLimitWindowMs?: number;
 }

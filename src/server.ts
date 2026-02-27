@@ -9,6 +9,54 @@ import { Registry } from './registry';
 import { SiteRegistration, CreateAppOptions } from './types';
 import { config } from './config';
 
+// ─── URL validation (SSRF prevention) ──────────────────────────────────────
+
+const PRIVATE_IP_RANGES = [
+  /^127\./,                   // loopback
+  /^10\./,                    // 10.0.0.0/8
+  /^172\.(1[6-9]|2\d|3[01])\./, // 172.16.0.0/12
+  /^192\.168\./,              // 192.168.0.0/16
+  /^169\.254\./,              // link-local
+  /^0\./,                     // 0.0.0.0/8
+];
+
+export function validateUrl(value: string, fieldName: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${fieldName} is not a valid URL`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${fieldName} must use http or https`);
+  }
+  const hostname = url.hostname;
+  if (hostname === 'localhost' || hostname === '::1' || hostname === '0.0.0.0') {
+    throw new Error(`${fieldName} must not point to a local address`);
+  }
+  if (PRIVATE_IP_RANGES.some(re => re.test(hostname))) {
+    throw new Error(`${fieldName} must not point to a private network`);
+  }
+  return url;
+}
+
+// ─── Fetch helper with timeout + size limit ─────────────────────────────────
+
+const MAX_SPEC_SIZE = 10_000_000; // 10 MB
+const FETCH_TIMEOUT_MS = 30_000;  // 30 seconds
+
+async function fetchSpec(specUrl: string): Promise<unknown> {
+  const res = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching spec`);
+  const text = await res.text();
+  if (text.length > MAX_SPEC_SIZE) {
+    throw new Error(`OpenAPI spec exceeds ${MAX_SPEC_SIZE} byte limit`);
+  }
+  return JSON.parse(text);
+}
+
+// ─── App factory ────────────────────────────────────────────────────────────
+
 export function createApp(options: CreateAppOptions = {}) {
   const apiKey = options.apiKey ?? config.apiKey;
   const gatewayUrl = options.gatewayUrl ?? config.gatewayUrl;
@@ -20,8 +68,11 @@ export function createApp(options: CreateAppOptions = {}) {
   // ─── Security & parsing ──────────────────────────────────────────────────────
 
   app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(cors());
-  app.use(express.json());
+
+  const corsOrigins = options.corsOrigins ?? (config.corsOrigins ? config.corsOrigins.split(',') : undefined);
+  app.use(cors(corsOrigins ? { origin: corsOrigins } : undefined));
+
+  app.use(express.json({ limit: '100kb' }));
 
   // ─── Rate limiting ───────────────────────────────────────────────────────────
 
@@ -90,6 +141,17 @@ export function createApp(options: CreateAppOptions = {}) {
       res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
       return;
     }
+
+    // Validate all user-provided URLs (SSRF prevention)
+    try {
+      validateUrl(siteUrl, 'siteUrl');
+      if (typeof apiUrl === 'string') validateUrl(apiUrl, 'apiUrl');
+      if (typeof openApiUrl === 'string') validateUrl(openApiUrl, 'openApiUrl');
+    } catch (err) {
+      res.status(400).json({ ok: false, error: (err as Error).message });
+      return;
+    }
+
     if (doors.has(slug)) {
       res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
       return;
@@ -104,9 +166,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
     let door: AgentDoor;
     try {
-      const specRes = await fetch(specUrl);
-      if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
-      const spec = await specRes.json();
+      const spec = await fetchSpec(specUrl);
       door = AgentDoor.fromOpenAPI(spec as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
         site: { name: siteName, url: siteUrl },
         rateLimit: typeof rl === 'number' ? rl : 60,
@@ -115,7 +175,8 @@ export function createApp(options: CreateAppOptions = {}) {
     } catch (err) {
       doors.delete(slug);
       const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });
+      console.error(`Failed to load OpenAPI spec from ${specUrl}: ${message}`);
+      res.status(400).json({ ok: false, error: 'Could not load OpenAPI spec' });
       return;
     }
 
@@ -197,7 +258,11 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // ─── Global error handler ───────────────────────────────────────────────────
 
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    if (err.type === 'entity.too.large') {
+      res.status(413).json({ ok: false, error: 'Request body too large' });
+      return;
+    }
     console.error('Unhandled error:', err.message);
     res.status(500).json({ ok: false, error: 'Internal server error' });
   });
@@ -209,9 +274,7 @@ export function createApp(options: CreateAppOptions = {}) {
       if (doors.has(reg.slug)) continue;
       const specUrl = reg.openApiUrl ?? `${reg.apiUrl}/openapi.json`;
       try {
-        const specRes = await fetch(specUrl);
-        if (!specRes.ok) throw new Error(`HTTP ${specRes.status}`);
-        const spec = await specRes.json();
+        const spec = await fetchSpec(specUrl);
         const door = AgentDoor.fromOpenAPI(spec as Parameters<typeof AgentDoor.fromOpenAPI>[0], reg.apiUrl, {
           site: { name: reg.siteName, url: reg.siteUrl },
           rateLimit: reg.rateLimit,

@@ -8,3 +8,11 @@ export interface SiteRegistration {
   audit: boolean;
   createdAt: Date;
 }
+
+export interface CreateAppOptions {
+  registry?: import('./registry').Registry;
+  apiKey?: string;
+  gatewayUrl?: string;
+  rateLimitMax?: number;
+  rateLimitWindowMs?: number;
+}

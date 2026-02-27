@@ -2,7 +2,14 @@ services:
   - type: web
     name: agent-door
     runtime: node
-    buildCommand: npm install --production
+    buildCommand: npm install && npm run build
     startCommand: node dist/server.js
     plan: free
     autoDeploy: true
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: GATEWAY_URL
+        value: https://agentdoor.io
+      - key: NODE_ENV
+        value: production

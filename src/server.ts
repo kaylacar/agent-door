@@ -1,141 +1,263 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { timingSafeEqual } from 'crypto';
+import { join } from 'path';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
-import { SiteRegistration } from './types';
+import { SiteRegistration, CreateAppOptions } from './types';
+import { config } from './config';
 
-const app = express();
-app.use(express.json());
+export function createApp(options: CreateAppOptions = {}) {
+  const apiKey = options.apiKey ?? config.apiKey;
+  const gatewayUrl = options.gatewayUrl ?? config.gatewayUrl;
+  const registry = options.registry ?? new Registry(join(config.dataDir, 'registry.json'));
+  const doors = new Map<string, AgentDoor>();
 
-const registry = new Registry();
-const doors = new Map<string, AgentDoor>();
+  const app = express();
 
-// ─── Health check ─────────────────────────────────────────────────────────────
+  // ─── Security & parsing ──────────────────────────────────────────────────────
 
-app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
-});
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(cors());
+  app.use(express.json());
 
-// ─── Registration ─────────────────────────────────────────────────────────────
+  // ─── Rate limiting ───────────────────────────────────────────────────────────
 
-app.post('/register', async (req: Request, res: Response) => {
-  const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit, audit } = req.body as Record<string, unknown>;
-
-  if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
-    res.status(400).json({ ok: false, error: 'Missing required fields: slug, siteName, siteUrl' });
-    return;
-  }
-  if (typeof apiUrl !== 'string' && typeof openApiUrl !== 'string') {
-    res.status(400).json({ ok: false, error: 'Provide apiUrl or openApiUrl' });
-    return;
-  }
-  if (!/^[a-z0-9-]{2,40}$/.test(slug)) {
-    res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
-    return;
-  }
-  if (doors.has(slug)) {
-    res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
-    return;
-  }
-
-  const resolvedApiUrl = (typeof apiUrl === 'string' ? apiUrl : siteUrl).replace(/\/$/, '');
-  const specUrl = typeof openApiUrl === 'string' ? openApiUrl : `${resolvedApiUrl}/openapi.json`;
-
-  let door: AgentDoor;
-  try {
-    const specRes = await fetch(specUrl);
-    if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
-    const spec = await specRes.json();
-    door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
-      site: { name: siteName, url: siteUrl },
-      rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-      audit: audit === true,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });
-    return;
-  }
-
-  const reg: SiteRegistration = {
-    slug,
-    siteName,
-    siteUrl,
-    apiUrl: resolvedApiUrl,
-    openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
-    rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-    audit: audit === true,
-    createdAt: new Date(),
-  };
-
-  registry.register(reg);
-  doors.set(slug, door);
-
-  res.json({
-    ok: true,
-    data: {
-      slug,
-      gateway_url: `https://agentdoor.io/${slug}`,
-      agents_txt: `https://agentdoor.io/${slug}/.well-known/agents.txt`,
-      agents_json: `https://agentdoor.io/${slug}/.well-known/agents.json`,
-    },
-  });
-});
-
-// ─── List registered sites ────────────────────────────────────────────────────
-
-app.get('/sites', (_req, res) => {
-  const sites = registry.list().map(s => ({
-    slug: s.slug,
-    siteName: s.siteName,
-    siteUrl: s.siteUrl,
-    gateway_url: `https://agentdoor.io/${s.slug}`,
-    createdAt: s.createdAt,
+  app.use(rateLimit({
+    windowMs: options.rateLimitWindowMs ?? config.rateLimit.windowMs,
+    max: options.rateLimitMax ?? config.rateLimit.max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: 'Too many requests, please try again later' },
   }));
-  res.json({ ok: true, data: sites });
-});
 
-// ─── Delete a registration ────────────────────────────────────────────────────
+  // ─── Request logging ─────────────────────────────────────────────────────────
 
-app.delete('/sites/:slug', (req, res) => {
-  const { slug } = req.params;
-  const door = doors.get(slug);
-  if (!door) {
-    res.status(404).json({ ok: false, error: `No site registered for '${slug}'` });
-    return;
-  }
-  door.destroy();
-  doors.delete(slug);
-  registry.delete(slug);
-  res.json({ ok: true, data: { slug, deleted: true } });
-});
-
-// ─── Agent Door routing ───────────────────────────────────────────────────────
-
-app.use('/:slug', (req, res, next) => {
-  const { slug } = req.params;
-  const door = doors.get(slug);
-  if (!door) {
-    res.status(404).json({ ok: false, error: `No agent door registered for '${slug}'` });
-    return;
-  }
-
-  // Strip the slug prefix before passing to the door middleware
-  const original = req.url;
-  req.url = original.replace(new RegExp(`^/${slug}`), '') || '/';
-
-  door.middleware()(req, res, () => {
-    // Restore URL if the door didn't handle it
-    req.url = original;
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      console.log(JSON.stringify({
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        duration: Date.now() - start,
+      }));
+    });
     next();
   });
-});
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+  // ─── Auth middleware ─────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => {
-  console.log(`Agent Door gateway running on port ${PORT}`);
-  console.log(`Register a site: POST http://localhost:${PORT}/register`);
-});
+  function requireAuth(req: Request, res: Response, next: NextFunction): void {
+    if (!apiKey) { next(); return; }
+    const header = req.headers.authorization;
+    if (!header?.startsWith('Bearer ')) {
+      res.status(401).json({ ok: false, error: 'Authorization required' });
+      return;
+    }
+    const token = header.slice(7);
+    const a = Buffer.from(token);
+    const b = Buffer.from(apiKey);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      res.status(403).json({ ok: false, error: 'Invalid API key' });
+      return;
+    }
+    next();
+  }
 
-export { app };
+  // ─── Health check ────────────────────────────────────────────────────────────
+
+  app.get('/', (_req, res) => {
+    res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
+  });
+
+  // ─── Registration (protected) ────────────────────────────────────────────────
+
+  app.post('/register', requireAuth, async (req: Request, res: Response) => {
+    const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit: rl, audit } = req.body as Record<string, unknown>;
+
+    if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
+      res.status(400).json({ ok: false, error: 'Missing required fields: slug, siteName, siteUrl' });
+      return;
+    }
+    if (typeof apiUrl !== 'string' && typeof openApiUrl !== 'string') {
+      res.status(400).json({ ok: false, error: 'Provide apiUrl or openApiUrl' });
+      return;
+    }
+    if (!/^[a-z0-9-]{2,40}$/.test(slug)) {
+      res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
+      return;
+    }
+    if (doors.has(slug)) {
+      res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
+      return;
+    }
+
+    const resolvedApiUrl = (typeof apiUrl === 'string' ? apiUrl : siteUrl).replace(/\/$/, '');
+    const specUrl = typeof openApiUrl === 'string' ? openApiUrl : `${resolvedApiUrl}/openapi.json`;
+
+    // Reserve slug before the async fetch to prevent race conditions
+    const sentinel = {} as AgentDoor;
+    doors.set(slug, sentinel);
+
+    let door: AgentDoor;
+    try {
+      const specRes = await fetch(specUrl);
+      if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
+      const spec = await specRes.json();
+      door = AgentDoor.fromOpenAPI(spec as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
+        site: { name: siteName, url: siteUrl },
+        rateLimit: typeof rl === 'number' ? rl : 60,
+        audit: audit === true,
+      });
+    } catch (err) {
+      doors.delete(slug);
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });
+      return;
+    }
+
+    const reg: SiteRegistration = {
+      slug,
+      siteName,
+      siteUrl,
+      apiUrl: resolvedApiUrl,
+      openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
+      rateLimit: typeof rl === 'number' ? rl : 60,
+      audit: audit === true,
+      createdAt: new Date(),
+    };
+
+    registry.register(reg);
+    doors.set(slug, door);
+
+    res.json({
+      ok: true,
+      data: {
+        slug,
+        gateway_url: `${gatewayUrl}/${slug}`,
+        agents_txt: `${gatewayUrl}/${slug}/.well-known/agents.txt`,
+        agents_json: `${gatewayUrl}/${slug}/.well-known/agents.json`,
+      },
+    });
+  });
+
+  // ─── List registered sites (protected) ──────────────────────────────────────
+
+  app.get('/sites', requireAuth, (_req, res) => {
+    const sites = registry.list().map(s => ({
+      slug: s.slug,
+      siteName: s.siteName,
+      siteUrl: s.siteUrl,
+      gateway_url: `${gatewayUrl}/${s.slug}`,
+      createdAt: s.createdAt,
+    }));
+    res.json({ ok: true, data: sites });
+  });
+
+  // ─── Delete a registration (protected) ──────────────────────────────────────
+
+  app.delete('/sites/:slug', requireAuth, (req, res) => {
+    const { slug } = req.params;
+    const door = doors.get(slug);
+    if (!door) {
+      res.status(404).json({ ok: false, error: `No site registered for '${slug}'` });
+      return;
+    }
+    door.destroy();
+    doors.delete(slug);
+    registry.delete(slug);
+    res.json({ ok: true, data: { slug, deleted: true } });
+  });
+
+  // ─── Agent Door routing ──────────────────────────────────────────────────────
+
+  app.use('/:slug', (req, res, next) => {
+    const { slug } = req.params;
+    const door = doors.get(slug);
+    if (!door) {
+      res.status(404).json({ ok: false, error: `No agent door registered for '${slug}'` });
+      return;
+    }
+
+    // Express may or may not strip the /:slug prefix from req.url.
+    // Ensure the prefix is removed exactly once before passing to door middleware.
+    const original = req.url;
+    req.url = original.startsWith(`/${slug}`)
+      ? (original.slice(slug.length + 1) || '/')
+      : original;
+
+    door.middleware()(req, res, () => {
+      req.url = original;
+      next();
+    });
+  });
+
+  // ─── Global error handler ───────────────────────────────────────────────────
+
+  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('Unhandled error:', err.message);
+    res.status(500).json({ ok: false, error: 'Internal server error' });
+  });
+
+  // ─── Lifecycle ──────────────────────────────────────────────────────────────
+
+  async function boot(): Promise<void> {
+    for (const reg of registry.list()) {
+      if (doors.has(reg.slug)) continue;
+      const specUrl = reg.openApiUrl ?? `${reg.apiUrl}/openapi.json`;
+      try {
+        const specRes = await fetch(specUrl);
+        if (!specRes.ok) throw new Error(`HTTP ${specRes.status}`);
+        const spec = await specRes.json();
+        const door = AgentDoor.fromOpenAPI(spec as Parameters<typeof AgentDoor.fromOpenAPI>[0], reg.apiUrl, {
+          site: { name: reg.siteName, url: reg.siteUrl },
+          rateLimit: reg.rateLimit,
+          audit: reg.audit,
+        });
+        doors.set(reg.slug, door);
+        console.log(`Restored door: ${reg.slug}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Failed to restore door for ${reg.slug}: ${msg}`);
+      }
+    }
+  }
+
+  function shutdown(): void {
+    for (const [, door] of doors) {
+      try { door.destroy(); } catch { /* ignore */ }
+    }
+    doors.clear();
+  }
+
+  return { app, registry, doors, boot, shutdown };
+}
+
+// ─── Start server ────────────────────────────────────────────────────────────
+
+if (require.main === module) {
+  const { app, boot, shutdown } = createApp();
+  boot()
+    .then(() => {
+      const server = app.listen(config.port, () => {
+        console.log(`Agent Door gateway running on port ${config.port}`);
+      });
+
+      const gracefulShutdown = (signal: string) => {
+        console.log(`\n${signal} received, shutting down...`);
+        shutdown();
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(1), 10_000).unref();
+      };
+
+      process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+      process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    })
+    .catch((err) => {
+      console.error('Failed to start:', err);
+      process.exit(1);
+    });
+}

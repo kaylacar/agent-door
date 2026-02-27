@@ -45,6 +45,18 @@ describe('isPrivateIP', () => {
     expect(isPrivateIP('::ffff:192.168.1.1')).toBe(true);
   });
 
+  it('blocks hex-form IPv6-mapped IPv4 private addresses', () => {
+    // URL parsers normalize ::ffff:A.B.C.D to ::ffff:XXYY:ZZWW
+    expect(isPrivateIP('::ffff:7f00:1')).toBe(true);   // 127.0.0.1
+    expect(isPrivateIP('::ffff:a00:1')).toBe(true);     // 10.0.0.1
+    expect(isPrivateIP('::ffff:c0a8:101')).toBe(true);  // 192.168.1.1
+    expect(isPrivateIP('::ffff:ac10:1')).toBe(true);    // 172.16.0.1
+  });
+
+  it('allows hex-form IPv6-mapped IPv4 public addresses', () => {
+    expect(isPrivateIP('::ffff:808:808')).toBe(false);  // 8.8.8.8
+  });
+
   it('allows IPv6-mapped IPv4 public addresses', () => {
     expect(isPrivateIP('::ffff:8.8.8.8')).toBe(false);
   });
@@ -84,6 +96,18 @@ describe('isPublicUrl', () => {
     expect(isPublicUrl('http://10.0.0.1')).toBe(false);
     expect(isPublicUrl('http://192.168.1.1')).toBe(false);
     expect(isPublicUrl('http://172.16.0.1')).toBe(false);
+  });
+
+  it('rejects IPv6 loopback and private URLs', () => {
+    expect(isPublicUrl('http://[::1]')).toBe(false);
+    expect(isPublicUrl('http://[::1]:8080')).toBe(false);
+    expect(isPublicUrl('http://[fe80::1]')).toBe(false);
+    expect(isPublicUrl('http://[fc00::1]')).toBe(false);
+    expect(isPublicUrl('http://[fd12::1]')).toBe(false);
+    // URL parser hex-normalizes mapped IPv4 (::ffff:127.0.0.1 → ::ffff:7f00:1)
+    expect(isPublicUrl('http://[::ffff:127.0.0.1]')).toBe(false);
+    expect(isPublicUrl('http://[::ffff:10.0.0.1]')).toBe(false);
+    expect(isPublicUrl('http://[::ffff:192.168.1.1]')).toBe(false);
   });
 
   it('rejects cloud metadata endpoints', () => {

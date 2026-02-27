@@ -15,7 +15,7 @@ const BLOCKED_HOSTNAMES = new Set([
   'localhost',
   '127.0.0.1',
   '0.0.0.0',
-  '[::1]',
+  '::1',            // URL.hostname strips brackets from IPv6
   'metadata.google.internal',
 ]);
 
@@ -28,9 +28,18 @@ function isPrivateIP(ip: string): boolean {
   if (net.isIPv6(ip)) {
     const normalized = ip.toLowerCase();
     if (normalized === '::1' || normalized.startsWith('fe80:') || normalized.startsWith('fc00:') || normalized.startsWith('fd')) return true;
-    // Block IPv6-mapped IPv4 addresses (::ffff:127.0.0.1)
+    // Block IPv6-mapped IPv4 addresses in dotted form (::ffff:127.0.0.1)
     const v4Mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
     if (v4Mapped && isPrivateIP(v4Mapped[1])) return true;
+    // Block IPv6-mapped IPv4 in hex form (::ffff:7f00:1 = 127.0.0.1)
+    // URL parsers normalize ::ffff:A.B.C.D to ::ffff:XXYY:ZZWW hex
+    const v4HexMapped = normalized.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (v4HexMapped) {
+      const high = parseInt(v4HexMapped[1], 16);
+      const low = parseInt(v4HexMapped[2], 16);
+      const ipv4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+      if (isPrivateIP(ipv4)) return true;
+    }
   }
   return false;
 }
@@ -43,8 +52,11 @@ function isPublicUrl(raw: string): boolean {
     return false;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  if (BLOCKED_HOSTNAMES.has(parsed.hostname)) return false;
-  if (PRIVATE_IP_RE.test(parsed.hostname)) return false;
+  // URL.hostname wraps IPv6 in brackets (e.g. '[::1]'); strip them for IP checks.
+  const hostname = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+  if (isPrivateIP(hostname)) return false;
   return true;
 }
 
@@ -278,6 +290,10 @@ export function createApp(options: CreateAppOptions = {}) {
     try {
       const specRes = await fetch(specUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
+      const contentLength = specRes.headers.get('content-length');
+      if (contentLength && parseInt(contentLength, 10) > MAX_SPEC_BYTES) {
+        throw new Error(`Spec exceeds ${MAX_SPEC_BYTES} byte limit`);
+      }
       specText = await specRes.text();
       if (specText.length > MAX_SPEC_BYTES) throw new Error(`Spec exceeds ${MAX_SPEC_BYTES} byte limit`);
       const spec = JSON.parse(specText);

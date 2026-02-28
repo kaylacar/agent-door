@@ -2,84 +2,58 @@ import { URL } from 'url';
 import dns from 'dns/promises';
 import net from 'net';
 
-/**
- * Blocks SSRF by resolving a URL's hostname and rejecting private/internal IPs.
- * Must be called before every server-side fetch of a user-supplied URL.
- */
-
-const BLOCKED_RANGES = [
-  // IPv4 private & special
-  { prefix: '10.', family: 4 },
-  { prefix: '172.16.', family: 4 }, { prefix: '172.17.', family: 4 },
-  { prefix: '172.18.', family: 4 }, { prefix: '172.19.', family: 4 },
-  { prefix: '172.20.', family: 4 }, { prefix: '172.21.', family: 4 },
-  { prefix: '172.22.', family: 4 }, { prefix: '172.23.', family: 4 },
-  { prefix: '172.24.', family: 4 }, { prefix: '172.25.', family: 4 },
-  { prefix: '172.26.', family: 4 }, { prefix: '172.27.', family: 4 },
-  { prefix: '172.28.', family: 4 }, { prefix: '172.29.', family: 4 },
-  { prefix: '172.30.', family: 4 }, { prefix: '172.31.', family: 4 },
-  { prefix: '192.168.', family: 4 },
-  { prefix: '127.', family: 4 },
-  { prefix: '169.254.', family: 4 }, // link-local / cloud metadata
-  { prefix: '0.', family: 4 },
+// RFC 1918 + loopback + link-local + metadata
+const PRIVATE_V4_PREFIXES = [
+  '10.', '127.', '0.', '169.254.', '192.168.',
+  ...Array.from({ length: 16 }, (_, i) => `172.${16 + i}.`),
 ];
 
-function isPrivateIPv4(ip: string): boolean {
-  return BLOCKED_RANGES.some(r => ip.startsWith(r.prefix));
+function isPrivateV4(ip: string) {
+  return PRIVATE_V4_PREFIXES.some(p => ip.startsWith(p));
 }
 
-function isPrivateIPv6(ip: string): boolean {
-  const lower = ip.toLowerCase();
-  return lower === '::1' ||
-    lower.startsWith('fc') ||
-    lower.startsWith('fd') ||
-    lower.startsWith('fe80') ||
-    lower === '::' ||
-    lower.startsWith('::ffff:127.') ||
-    lower.startsWith('::ffff:10.') ||
-    lower.startsWith('::ffff:192.168.') ||
-    lower.startsWith('::ffff:169.254.');
-}
-
-function isPrivateIP(ip: string): boolean {
-  if (net.isIPv4(ip)) return isPrivateIPv4(ip);
-  if (net.isIPv6(ip)) return isPrivateIPv6(ip);
+function isPrivateV6(ip: string) {
+  const l = ip.toLowerCase();
+  if (l === '::1' || l === '::') return true;
+  if (l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe80')) return true;
+  // v4-mapped v6
+  if (l.startsWith('::ffff:')) return isPrivateV4(l.slice(7));
   return false;
 }
 
-export async function validateExternalUrl(rawUrl: string): Promise<void> {
+function isPrivate(ip: string) {
+  if (net.isIPv4(ip)) return isPrivateV4(ip);
+  if (net.isIPv6(ip)) return isPrivateV6(ip);
+  return false;
+}
+
+export async function validateExternalUrl(rawUrl: string) {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error('Invalid URL');
+    throw new Error('invalid URL');
   }
 
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error('Only http and https URLs are allowed');
+    throw new Error('only http/https allowed');
   }
 
-  const hostname = parsed.hostname;
+  const host = parsed.hostname;
 
-  // Block raw IPs directly
-  if (net.isIP(hostname)) {
-    if (isPrivateIP(hostname)) {
-      throw new Error('URLs pointing to private/internal addresses are not allowed');
-    }
+  if (net.isIP(host)) {
+    if (isPrivate(host)) throw new Error('private/internal address');
     return;
   }
 
-  // Resolve hostname and check all resulting IPs
-  let addresses: { address: string; family: number }[];
+  let addrs: { address: string; family: number }[];
   try {
-    addresses = await dns.lookup(hostname, { all: true });
+    addrs = await dns.lookup(host, { all: true });
   } catch {
-    throw new Error(`Could not resolve hostname: ${hostname}`);
+    throw new Error(`can't resolve ${host}`);
   }
 
-  for (const addr of addresses) {
-    if (isPrivateIP(addr.address)) {
-      throw new Error('URLs pointing to private/internal addresses are not allowed');
-    }
+  for (const a of addrs) {
+    if (isPrivate(a.address)) throw new Error('resolves to private/internal address');
   }
 }

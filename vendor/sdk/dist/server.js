@@ -32,12 +32,7 @@ class AgentDoor {
         this.agentsJsonPath = `${this.basePath}/agents.json`;
         this.routes = this.buildRoutes();
     }
-    // ─── Static factory: build from OpenAPI spec ────────────────────────────────
-    /**
-     * Create an AgentDoor that proxies requests to an existing API described by
-     * an OpenAPI 3.x spec. The site owner provides no handler code — capabilities
-     * are inferred from the spec and calls are forwarded to baseUrl.
-     */
+    // Build from an OpenAPI 3.x spec, proxying requests to baseUrl
     static fromOpenAPI(spec, baseUrl, overrides = {}) {
         const capabilities = [];
         const methodMap = {
@@ -116,7 +111,6 @@ class AgentDoor {
             ...overrides,
         });
     }
-    // ─── Express middleware ──────────────────────────────────────────────────────
     middleware() {
         return async (req, res, next) => {
             // Auto-discovery + CORS on every response
@@ -145,7 +139,6 @@ class AgentDoor {
             }
         };
     }
-    // ─── Fetch-compatible handler (Next.js App Router, Cloudflare Workers, Deno) ─
     handler() {
         const agentsJsonPath = this.agentsJsonPath;
         return async (request) => {
@@ -174,7 +167,6 @@ class AgentDoor {
             return new globalThis.Response(body, { status: result.status, headers });
         };
     }
-    // ─── Core dispatcher ─────────────────────────────────────────────────────────
     async dispatch(req) {
         for (const route of this.routes) {
             const match = matchRoute(route.pattern, req.path);
@@ -185,7 +177,6 @@ class AgentDoor {
         }
         return null;
     }
-    // ─── Route table ─────────────────────────────────────────────────────────────
     buildRoutes() {
         const routes = [];
         const apiBase = `${this.basePath}/agents/api`;
@@ -290,7 +281,6 @@ class AgentDoor {
         }
         return routes;
     }
-    // ─── HTML link injection (Express) ───────────────────────────────────────────
     injectHtmlLink(res) {
         const linkTag = `<link rel="${AGENTS_REL}" href="${this.agentsJsonPath}">`;
         const originalSend = res.send.bind(res);
@@ -312,7 +302,6 @@ class AgentDoor {
     }
 }
 exports.AgentDoor = AgentDoor;
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function corsHeaders(agentsJsonPath) {
     return {
         'Access-Control-Allow-Origin': '*',

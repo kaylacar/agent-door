@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { timingSafeEqual } from 'crypto';
+import { timingSafeEqual, randomUUID } from 'crypto';
 import { join } from 'path';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
@@ -62,6 +62,12 @@ export function createApp(options: CreateAppOptions = {}) {
   const gatewayUrl = options.gatewayUrl ?? config.gatewayUrl;
   const registry = options.registry ?? new Registry(join(config.dataDir, 'registry.json'));
   const doors = new Map<string, AgentDoor>();
+  const startedAt = Date.now();
+  const metrics = {
+    totalRequests: 0,
+    totalDurationMs: 0,
+    statusCodes: {} as Record<number, number>,
+  };
 
   const app = express();
 
@@ -84,16 +90,24 @@ export function createApp(options: CreateAppOptions = {}) {
     message: { ok: false, error: 'Too many requests, please try again later' },
   }));
 
-  // ─── Request logging ─────────────────────────────────────────────────────────
+  // ─── Request ID + logging ────────────────────────────────────────────────────
 
   app.use((req: Request, res: Response, next: NextFunction) => {
+    const requestId = (req.headers['x-request-id'] as string) || randomUUID();
+    res.setHeader('X-Request-Id', requestId);
+
     const start = Date.now();
     res.on('finish', () => {
+      const duration = Date.now() - start;
+      metrics.totalRequests++;
+      metrics.statusCodes[res.statusCode] = (metrics.statusCodes[res.statusCode] ?? 0) + 1;
+      metrics.totalDurationMs += duration;
       console.log(JSON.stringify({
+        requestId,
         method: req.method,
         path: req.path,
         status: res.statusCode,
-        duration: Date.now() - start,
+        duration,
       }));
     });
     next();
@@ -121,7 +135,135 @@ export function createApp(options: CreateAppOptions = {}) {
   // ─── Health check ────────────────────────────────────────────────────────────
 
   app.get('/', (_req, res) => {
-    res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
+    const mem = process.memoryUsage();
+    res.json({
+      ok: true,
+      service: 'Agent Door Gateway',
+      version: '0.1.0',
+      uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+      doors: doors.size,
+      memory: {
+        rss_mb: Math.round(mem.rss / 1_048_576),
+        heap_used_mb: Math.round(mem.heapUsed / 1_048_576),
+      },
+    });
+  });
+
+  // ─── Metrics ───────────────────────────────────────────────────────────────
+
+  app.get('/metrics', requireAuth, (_req, res) => {
+    res.json({
+      ok: true,
+      data: {
+        uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+        doors: doors.size,
+        registrations: registry.list().length,
+        requests: {
+          total: metrics.totalRequests,
+          avg_duration_ms: metrics.totalRequests > 0
+            ? Math.round(metrics.totalDurationMs / metrics.totalRequests)
+            : 0,
+          by_status: metrics.statusCodes,
+        },
+        memory: process.memoryUsage(),
+      },
+    });
+  });
+
+  // ─── OpenAPI spec ──────────────────────────────────────────────────────────
+
+  app.get('/openapi.json', (_req, res) => {
+    res.json({
+      openapi: '3.0.3',
+      info: {
+        title: 'Agent Door Gateway',
+        version: '0.1.0',
+        description: 'Hosted gateway that provides standardized agent access to any website via the agents-protocol.',
+      },
+      servers: [{ url: gatewayUrl }],
+      paths: {
+        '/': {
+          get: {
+            summary: 'Health check',
+            responses: { '200': { description: 'Service health with uptime, door count, and memory usage' } },
+          },
+        },
+        '/register': {
+          post: {
+            summary: 'Register a new agent door',
+            security: [{ bearerAuth: [] }],
+            requestBody: {
+              required: true,
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['slug', 'siteName', 'siteUrl'],
+                    properties: {
+                      slug: { type: 'string', pattern: '^[a-z0-9-]{2,40}$' },
+                      siteName: { type: 'string' },
+                      siteUrl: { type: 'string', format: 'uri' },
+                      apiUrl: { type: 'string', format: 'uri' },
+                      openApiUrl: { type: 'string', format: 'uri' },
+                      rateLimit: { type: 'number', default: 60 },
+                      audit: { type: 'boolean', default: false },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              '200': { description: 'Registration successful' },
+              '400': { description: 'Validation error or failed to load OpenAPI spec' },
+              '409': { description: 'Slug already registered' },
+            },
+          },
+        },
+        '/sites': {
+          get: {
+            summary: 'List registered sites',
+            security: [{ bearerAuth: [] }],
+            responses: { '200': { description: 'Array of registered sites' } },
+          },
+        },
+        '/sites/{slug}': {
+          delete: {
+            summary: 'Delete a registration',
+            security: [{ bearerAuth: [] }],
+            parameters: [{ name: 'slug', in: 'path', required: true, schema: { type: 'string' } }],
+            responses: {
+              '200': { description: 'Deletion successful' },
+              '404': { description: 'Slug not found' },
+            },
+          },
+        },
+        '/metrics': {
+          get: {
+            summary: 'Request metrics and system stats',
+            security: [{ bearerAuth: [] }],
+            responses: { '200': { description: 'Metrics data' } },
+          },
+        },
+        '/{slug}/{path}': {
+          get: {
+            summary: 'Proxy to registered agent door',
+            parameters: [
+              { name: 'slug', in: 'path', required: true, schema: { type: 'string' } },
+              { name: 'path', in: 'path', required: true, schema: { type: 'string' } },
+            ],
+            responses: {
+              '200': { description: 'Proxied response from agent door' },
+              '404': { description: 'No agent door registered for slug' },
+            },
+          },
+        },
+      },
+      components: {
+        securitySchemes: {
+          bearerAuth: { type: 'http', scheme: 'bearer' },
+        },
+      },
+    });
   });
 
   // ─── Registration (protected) ────────────────────────────────────────────────

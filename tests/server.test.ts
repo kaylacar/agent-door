@@ -66,14 +66,72 @@ describe('Agent Door Gateway', () => {
   // ─── Health check ──────────────────────────────────────────────────────────
 
   describe('GET /', () => {
-    it('returns 200 with service info', async () => {
+    it('returns 200 with service info and operational stats', async () => {
       const res = await request(app).get('/');
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({
-        ok: true,
-        service: 'Agent Door Gateway',
-        version: '0.1.0',
-      });
+      expect(res.body.ok).toBe(true);
+      expect(res.body.service).toBe('Agent Door Gateway');
+      expect(res.body.version).toBe('0.1.0');
+      expect(typeof res.body.uptime_seconds).toBe('number');
+      expect(typeof res.body.doors).toBe('number');
+      expect(typeof res.body.memory.rss_mb).toBe('number');
+      expect(typeof res.body.memory.heap_used_mb).toBe('number');
+    });
+  });
+
+  // ─── Request ID ─────────────────────────────────────────────────────────
+
+  describe('X-Request-Id', () => {
+    it('generates a request ID when none is provided', async () => {
+      const res = await request(app).get('/');
+      expect(res.headers['x-request-id']).toBeDefined();
+      expect(res.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it('echoes back a provided request ID', async () => {
+      const res = await request(app)
+        .get('/')
+        .set('X-Request-Id', 'my-custom-id-123');
+      expect(res.headers['x-request-id']).toBe('my-custom-id-123');
+    });
+  });
+
+  // ─── Metrics ────────────────────────────────────────────────────────────
+
+  describe('GET /metrics', () => {
+    it('returns request metrics and system stats', async () => {
+      // Make a couple requests first to generate metrics
+      await request(app).get('/');
+      await request(app).get('/');
+
+      const res = await request(app).get('/metrics');
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.data.uptime_seconds).toBeGreaterThanOrEqual(0);
+      expect(typeof res.body.data.doors).toBe('number');
+      expect(typeof res.body.data.registrations).toBe('number');
+      expect(res.body.data.requests.total).toBeGreaterThanOrEqual(2);
+      expect(typeof res.body.data.requests.avg_duration_ms).toBe('number');
+      expect(typeof res.body.data.requests.by_status).toBe('object');
+      expect(typeof res.body.data.memory).toBe('object');
+    });
+  });
+
+  // ─── OpenAPI spec ───────────────────────────────────────────────────────
+
+  describe('GET /openapi.json', () => {
+    it('returns a valid OpenAPI 3.0 spec', async () => {
+      const res = await request(app).get('/openapi.json');
+      expect(res.status).toBe(200);
+      expect(res.body.openapi).toBe('3.0.3');
+      expect(res.body.info.title).toBe('Agent Door Gateway');
+      expect(res.body.paths).toBeDefined();
+      expect(res.body.paths['/']).toBeDefined();
+      expect(res.body.paths['/register']).toBeDefined();
+      expect(res.body.paths['/sites']).toBeDefined();
+      expect(res.body.paths['/sites/{slug}']).toBeDefined();
+      expect(res.body.paths['/metrics']).toBeDefined();
+      expect(res.body.components.securitySchemes.bearerAuth).toBeDefined();
     });
   });
 

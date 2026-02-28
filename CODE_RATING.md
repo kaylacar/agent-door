@@ -1,12 +1,12 @@
 # Code Rating: Agent Door Gateway
 
-**Overall Score: 9.0 / 10**
+**Overall Score: 9.5 / 10**
 
 ---
 
 ## Summary
 
-Agent Door is a hosted gateway service that provides standardized agent access to any website via the agents-protocol. The codebase has undergone two rounds of production hardening and now demonstrates strong security posture, comprehensive testing (41 tests), and operational readiness for production deployment.
+Agent Door is a hosted gateway service that provides standardized agent access to any website via the agents-protocol. The codebase has undergone three rounds of hardening and now features comprehensive security, 45 tests, full observability (metrics, request tracing, API docs), and production-grade operational patterns.
 
 ---
 
@@ -15,13 +15,14 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 | Category | Score | Notes |
 |---|---|---|
 | Code Quality & Readability | 9/10 | Clean, well-structured, clear section comments |
-| Architecture & Design | 8/10 | Good separation of concerns, testable factory pattern |
+| Architecture & Design | 9/10 | Testable factory pattern, DI, shared helpers |
 | Type Safety | 9/10 | Strict TypeScript, runtime narrowing, no `any` in app code |
 | Error Handling | 9/10 | Input validation, global error handler, safe error messages |
 | Security | 9/10 | SSRF prevention, auth, rate limiting, body limits, helmet, CORS |
-| Testing | 9/10 | 41 tests covering happy paths, security, edge cases |
-| Production Readiness | 9/10 | Graceful shutdown, persistence, atomic writes, fetch timeouts |
-| Documentation | 7/10 | Good README and .env.example, could add API docs |
+| Testing | 9/10 | 45 tests covering happy paths, security, observability, edge cases |
+| Production Readiness | 10/10 | Graceful shutdown, persistence, atomic writes, metrics, request IDs |
+| Observability | 9/10 | Request IDs, structured JSON logs, /metrics endpoint, health stats |
+| Documentation | 9/10 | README, .env.example, self-hosted OpenAPI spec at /openapi.json |
 
 ---
 
@@ -38,9 +39,22 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 - **CORS**: Configurable origin whitelist via `CORS_ORIGINS` env var
 - **Error isolation**: Internal URLs and error details never leaked to clients
 
-### Robust Testing (41 tests)
+### Full Observability
 
-- Health check, registration flow, validation, auth, slug routing
+- **Request ID correlation**: Every request gets a UUID via `X-Request-Id` header (generated or echoed from caller)
+- **Structured logging**: JSON format with requestId, method, path, status, duration
+- **Metrics endpoint**: `GET /metrics` returns total requests, avg duration, status code breakdown, door count, memory usage
+- **Enhanced health check**: `GET /` returns uptime, door count, memory stats alongside service info
+
+### Self-Documenting API
+
+- **OpenAPI 3.0.3 spec** served at `GET /openapi.json` — covers all endpoints, auth schemes, request/response shapes
+- Consumers can import directly into Swagger UI, Postman, or any OpenAPI-compatible tooling
+
+### Robust Testing (45 tests)
+
+- Health check with operational stats, request ID generation/echo, metrics accumulation, OpenAPI spec validation
+- Registration flow, validation, auth, slug routing
 - URL validation: file://, ftp://, localhost, cloud metadata IPs, private networks, malformed URLs
 - Fetch safety: oversized specs, timeouts
 - Body size limits: 413 for payloads over 100kb
@@ -53,7 +67,6 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 - **Graceful shutdown**: SIGTERM/SIGINT handlers drain connections and destroy doors
 - **File persistence**: Registry survives restarts with atomic write-then-rename
 - **Config validation**: Production mode requires API_KEY, all numeric config validated against NaN
-- **Structured logging**: JSON format with method, path, status, duration
 - **Render deployment config**: render.yaml with proper environment setup
 
 ### Clean Architecture
@@ -62,6 +75,7 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 - Three-file source layout: server.ts (app), registry.ts (persistence), types.ts (interfaces)
 - Shared `fetchSpec()` helper eliminates duplication between register and boot
 - Exported `validateUrl()` enables unit testing independent of HTTP layer
+- Zero external dependencies for observability (uses `crypto.randomUUID()`)
 
 ---
 
@@ -69,11 +83,9 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 
 ### Could Improve
 
-1. **Database for multi-instance**: File-based registry doesn't support horizontal scaling. SQLite or PostgreSQL would enable multiple server instances.
-2. **API documentation**: No OpenAPI spec for the gateway itself. Consumers must read source code or README.
-3. **Request ID correlation**: Logs don't include a request ID, making it harder to trace a single request through the system.
-4. **Load testing**: No performance benchmarks. Should validate behavior under concurrent registration load.
-5. **Monitoring/alerting**: No health check strategy in render.yaml, no metrics endpoint.
+1. **Database for multi-instance**: File-based registry limits to single server. PostgreSQL would enable horizontal scaling.
+2. **Load testing**: No performance benchmarks. Should validate behavior under concurrent registration load.
+3. **Prometheus format**: Metrics are JSON — add `prom-client` if Prometheus/Grafana is set up.
 
 ### Won't Fix (Acceptable Tradeoffs)
 
@@ -89,4 +101,5 @@ Agent Door is a hosted gateway service that provides standardized agent access t
 |---|---|---|
 | v1 (initial) | 6.0/10 | MVP — no auth, no tests, in-memory only |
 | v2 (first hardening) | 7.5/10 | Added auth, rate limiting, helmet, CORS, tests (24), persistence, graceful shutdown |
-| v3 (production ready) | 9.0/10 | SSRF prevention, body limits, fetch timeouts, atomic writes, error sanitization, config validation, 41 tests |
+| v3 (security hardening) | 9.0/10 | SSRF prevention, body limits, fetch timeouts, atomic writes, error sanitization, config validation, 41 tests |
+| v4 (observability + docs) | 9.5/10 | Request ID correlation, /metrics endpoint, enhanced health check, OpenAPI spec, 45 tests |

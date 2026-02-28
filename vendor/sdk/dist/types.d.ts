@@ -43,6 +43,7 @@ export interface AgentDoorConfig {
     sessionTtl?: number;
     audit?: boolean;
     basePath?: string;
+    corsOrigin?: string;
 }
 export interface SessionData {
     sessionToken: string;

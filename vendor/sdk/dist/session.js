@@ -1,7 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SessionManager = void 0;
-const uuid_1 = require("uuid");
+const crypto = require("crypto");
 class SessionManager {
     sessions = new Map();
     cleanupInterval;
@@ -13,7 +13,7 @@ class SessionManager {
     }
     capabilityNames;
     createSession(siteId) {
-        const sessionToken = (0, uuid_1.v4)();
+        const sessionToken = crypto.randomBytes(32).toString('hex');
         const expiresAt = new Date(Date.now() + this.ttl * 1000);
         const session = {
             sessionToken,

@@ -152,3 +152,30 @@ describe('single-char slug', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('ADMIN_API_KEY unset', () => {
+  it('returns 503 when key is not configured', async () => {
+    const saved = process.env.ADMIN_API_KEY;
+    delete process.env.ADMIN_API_KEY;
+    try {
+      const res = await get('/sites', AUTH);
+      expect(res.status).toBe(503);
+      expect((await res.json()).error).toMatch(/not configured/i);
+    } finally {
+      process.env.ADMIN_API_KEY = saved;
+    }
+  });
+});
+
+// Keep this last — it exhausts the per-IP rate limit budget for all admin endpoints
+describe('admin rate limiting', () => {
+  it('returns 429 after too many requests', async () => {
+    const promises = [];
+    for (let i = 0; i < 25; i++) {
+      promises.push(post('/register', { slug: 'rl' }, AUTH));
+    }
+    const results = await Promise.all(promises);
+    const statuses = results.map(r => r.status);
+    expect(statuses).toContain(429);
+  });
+});

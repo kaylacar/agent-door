@@ -1,9 +1,9 @@
 # Agent Door — Pre-Production Code Review
 
-**Date:** 2026-02-28 (updated)
-**Reviewer:** Claude (senior eng, second review pass)
+**Date:** 2026-02-28 (final pass)
+**Reviewer:** Claude (senior eng)
 **Branch:** `claude/pre-production-code-review-jEjXc`
-**Status:** Additional security and production fixes applied. Remaining items documented below.
+**Status:** All identified issues fixed. Remaining items are infrastructure-level (documented below).
 
 ---
 
@@ -22,54 +22,70 @@ Agent Door is a hosted gateway that gives autonomous agents managed access to an
 ### 1. SSRF Vulnerability — FIXED
 `src/url-guard.ts` added. The `/register` endpoint previously fetched any user-supplied URL server-side with no restrictions. Now all URLs are resolved via DNS and checked against private/internal IP ranges (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x metadata, IPv6 equivalents) before any `fetch()` call.
 
-Both `specUrl` and `resolvedApiUrl` are validated in `src/server.ts:73-80`.
+Both `specUrl` and `resolvedApiUrl` are validated in `src/server.ts`.
 
 ### 2. Admin Authentication — FIXED
-`requireAdminKey` middleware in `src/server.ts:23-35` gates `/register`, `GET /sites`, and `DELETE /sites/:slug`. Reads `ADMIN_API_KEY` from env. Returns 503 if the key is not configured (fail-closed). Accepts `X-Api-Key` header or `Authorization: Bearer <key>`.
+`requireAdminKey` middleware gates `/register`, `GET /sites`, and `DELETE /sites/:slug`. Reads `ADMIN_API_KEY` from env. Returns 503 if the key is not configured (fail-closed). Accepts `X-Api-Key` header or `Authorization: Bearer <key>`.
 
 ### 3. Reserved Slugs — FIXED
-`RESERVED_SLUGS` set in `src/server.ts:16-19` blocks `register`, `sites`, `health`, `admin`, `api`, `static`, `assets`, `favicon.ico`, `robots.txt`, `.well-known` from being registered as site slugs, preventing route shadowing.
+`RESERVED_SLUGS` set blocks `register`, `sites`, `health`, `admin`, `api`, `static`, `assets`, `favicon.ico`, `robots.txt`, `.well-known` from being registered as site slugs, preventing route shadowing.
 
 ### 4. Hardcoded Domain — FIXED
-`BASE_URL` env var in `src/server.ts:13` replaces all hardcoded `https://agentdoor.io` references. Defaults to `https://agentdoor.io`.
+`BASE_URL` env var replaces all hardcoded `https://agentdoor.io` references. Defaults to `https://agentdoor.io`.
 
 ### 5. Regex from User Input — FIXED
-`src/server.ts:164` now uses `original.startsWith(prefix) ? original.slice(prefix.length)` instead of `new RegExp(slug)`.
+Proxy URL rewriting now uses `startsWith` + `slice` instead of `new RegExp(slug)`.
 
 ### 6. Misleading Audit Feature — FIXED
-`audit` is now hardcoded to `false` in `src/server.ts:90,105`. The `AuditManager` in `vendor/sdk/dist/audit.js` is a complete stub (all methods are no-ops). It was previously exposed to users as a working feature.
+`audit` is hardcoded to `false`. The `AuditManager` in `vendor/sdk/dist/audit.js` is a complete stub.
 
 ### 7. Request Body Limit — FIXED
-`express.json({ limit: '1mb' })` in `src/server.ts:8`.
+`express.json({ limit: '1mb' })`.
 
 ### 8. Build Restored — FIXED
 `package.json` build script runs `tsc`. `render.yaml` does `npm install && npm run build`.
 
 ### 9. Timing-Safe Admin Key Comparison — FIXED
-`requireAdminKey` in `src/server.ts` now uses `crypto.timingSafeEqual()` instead of `===` to compare the API key, preventing timing side-channel attacks on key brute-forcing.
+`requireAdminKey` uses `crypto.timingSafeEqual()` instead of `===` to compare the API key, preventing timing side-channel attacks.
 
 ### 10. IPv6 SSRF Bypass — FIXED
-`src/url-guard.ts` had a bug where IPv6 literal URLs (e.g. `http://[::1]/`) bypassed the private IP check. Node's `URL` parser preserves brackets in `hostname`, so `net.isIP('[::1]')` returned `0` and the address fell through to DNS resolution instead of being caught as a private IP. Fixed by stripping brackets before the `net.isIP()` check.
-
-Also fixed IPv4-mapped IPv6 in hex form: the URL parser normalizes `::ffff:127.0.0.1` to `::ffff:7f00:1`, which `isPrivateV6` didn't handle. Added hex-to-dotted conversion for the mapped portion.
+Node's `URL` parser preserves brackets on IPv6 hostnames, so `net.isIP('[::1]')` returned `0` and fell through to DNS. Fixed by stripping brackets before `net.isIP()`. Also fixed IPv4-mapped IPv6 hex form (`::ffff:7f00:1` → dotted conversion).
 
 ### 11. SDK Proxy Origin Validation — FIXED
-`vendor/sdk/dist/server.js` proxy handler now validates that the constructed URL's origin matches the registered `baseUrl` origin before fetching, preventing path-traversal attacks from escaping the intended upstream host.
+Proxy handler validates that the constructed URL's origin matches the registered `baseUrl` origin before fetching, preventing path-traversal escapes.
 
 ### 12. Upstream Error Leakage — FIXED
-`vendor/sdk/dist/server.js` no longer includes upstream response bodies in error messages returned to agents. Error messages now only include the HTTP status code (e.g. `Upstream returned 500`).
+Proxy error messages now only include the HTTP status code, not upstream response bodies.
 
 ### 13. Atomic Registry Writes — FIXED
-`src/registry.ts` `flush()` now writes to a temp file then `rename()`s atomically, preventing data corruption from interrupted writes or concurrent flushes.
+`flush()` writes to temp file then `rename()`s atomically.
 
 ### 14. Server Listen Guard — FIXED
-`src/server.ts` now only calls `app.listen()` when run directly (`require.main === module`), not when imported by tests. Previously, importing the module in tests would start a listener on port 3000 as a side effect.
+`app.listen()` only runs when `require.main === module`, not when imported by tests.
 
 ### 15. `dist/` Removed from Git — FIXED
-`dist/` added to `.gitignore` and removed from tracking. The build pipeline generates it from source.
+Added to `.gitignore`, removed from tracking.
 
 ### 16. README Updated — FIXED
-Curl examples now include `X-Api-Key` auth header. Response format updated to match actual server output. Misleading "signed audit artifact" claim removed.
+Curl examples include auth headers. Response format matches actual output. False "signed audit artifact" claim removed.
+
+### 17. Doors Restored on Startup — FIXED
+`restoreDoors()` in `src/server.ts` rebuilds `AgentDoor` instances from persisted registry on process start. Sites that fail to restore (e.g. upstream spec unavailable) are logged but don't block startup.
+
+### 18. Admin Rate Limiting — FIXED
+`requireAdminKey` middleware now enforces 20 req/min per IP using an in-memory sliding window, preventing API key brute-force attacks.
+
+### 19. CORS Configurable — FIXED
+CORS `Access-Control-Allow-Origin` is now configurable via `CORS_ORIGIN` env var (passed through as `corsOrigin` in `AgentDoorConfig`). Defaults to `*` for backwards compatibility. Set to a specific origin for production.
+
+### 20. Session Tokens Use crypto.randomBytes — FIXED
+`vendor/sdk/dist/session.js` now uses `crypto.randomBytes(32).toString('hex')` instead of `uuid.v4()`, producing cryptographically opaque 256-bit session tokens.
+
+### 21. Graceful Shutdown — FIXED
+SIGTERM/SIGINT handlers drain connections, destroy all `AgentDoor` instances (cleaning up intervals), and exit. Force-exits after 10s if connections aren't drained.
+
+### 22. Request Logging — FIXED
+Logging middleware in `src/server.ts` logs `METHOD /path STATUS TIMEms` for every request.
 
 ---
 
@@ -80,37 +96,34 @@ Curl examples now include `X-Api-Key` auth header. Response format updated to ma
 | `ADMIN_API_KEY` | **Yes** | *(none — 503 if unset)* | Authenticates admin endpoints |
 | `BASE_URL` | No | `https://agentdoor.io` | Public URL used in response payloads |
 | `PORT` | No | `3000` | Server listen port (Render sets this) |
+| `CORS_ORIGIN` | No | `*` | CORS `Access-Control-Allow-Origin` value |
 
 ---
 
 ## Known Issues Still Open
 
-### HIGH — `doors` Map is in-memory only
-`src/registry.ts` now persists site registrations to `data/sites.json`, but the `doors` Map in `src/server.ts:11` (which holds live `AgentDoor` instances) is rebuilt only when sites are registered. On restart, registrations survive in the JSON file but the `AgentDoor` middleware instances are lost. The server needs a startup routine that reconstructs `AgentDoor` instances from the registry, or the entire system needs a database-backed approach.
-
-### MEDIUM — CORS is `Access-Control-Allow-Origin: *`
-`vendor/sdk/dist/server.js:118` sets wide-open CORS on every response. Any webpage can make requests through the gateway. Consider restricting to known agent origins or at minimum not reflecting credentials.
-
-### MEDIUM — No rate limiting on admin endpoints
-The `requireAdminKey` middleware has no rate limiting. An attacker can brute-force the API key (mitigated by timing-safe comparison, but not prevented). Consider adding rate limiting to `/register`, `GET /sites`, and `DELETE /sites/:slug`.
-
-### MEDIUM — Session tokens are UUIDs
-`vendor/sdk/dist/session.js:16` uses `uuid.v4()`. Consider `crypto.randomBytes(32).toString('hex')` if sessions ever carry authorization weight.
-
 ### LOW — Render free tier
 Free tier has cold starts, sleeps after 15 min inactivity, and limited bandwidth. Not suitable for a production gateway that agents depend on.
 
-### LOW — No graceful shutdown
-No SIGTERM handler — in-flight requests are dropped and cleanup intervals in `SessionManager`/`RateLimiter` are never cleared on shutdown.
+### LOW — Admin rate limiter is in-memory
+The admin rate limiter shares the same single-process limitation as sessions and the SDK rate limiter. If the service scales horizontally, it needs Redis or similar shared storage.
 
-### LOW — No request logging
-No structured logging for requests, auth events, or errors. Add a logging library (pino, winston) for production observability.
+### LOW — No CI pipeline
+Tests exist (`vitest run`) but there is no CI configuration (GitHub Actions, etc.) to run them automatically on push/PR.
 
 ---
 
 ## Architecture Notes for Future Work
 
-- **Registry persistence:** Replace the `Map` in `src/registry.ts` with a database-backed store. The `Registry` class interface (`register`, `get`, `list`, `delete`) is clean and can wrap any backend.
-- **SDK is vendored JS-only:** `vendor/sdk/` has no TypeScript source, no tests, no way to rebuild. Changes to SDK behavior require editing compiled JS directly. Consider publishing the SDK as a proper package or at minimum keeping the source alongside the compiled output.
-- **Session tokens are UUIDs:** `vendor/sdk/dist/session.js:16` uses `uuid.v4()` for session tokens. These are not cryptographically opaque — consider using `crypto.randomBytes(32).toString('hex')` for session tokens if sessions ever carry authorization weight.
-- **Single-process architecture:** Everything runs in one Node process. If this needs to scale horizontally, the in-memory session store, rate limiter, and registry all need to move to shared storage (Redis, DB).
+- **Registry persistence:** The `Registry` class writes to `data/sites.json`. For production scale, replace with a database-backed store. The interface (`register`, `get`, `list`, `delete`) can wrap any backend.
+- **SDK is vendored JS-only:** `vendor/sdk/` has no TypeScript source, no tests, no way to rebuild. Changes require editing compiled JS directly. Consider publishing as a proper package.
+- **Single-process architecture:** Everything runs in one Node process. Horizontal scaling requires moving session store, rate limiters, and registry to shared storage (Redis, DB).
+
+---
+
+## Test Coverage
+
+31 tests across 2 test files:
+
+- `src/url-guard.test.ts` (12 tests): protocol validation, garbage URLs, all private IP ranges (IPv4, IPv6, IPv4-mapped IPv6, link-local, metadata), positive case (public IPs)
+- `src/server.test.ts` (19 tests): health endpoint, auth (6 cases), registration validation (7 cases including SSRF), CRUD operations, 503 on missing key, admin rate limiting (429)

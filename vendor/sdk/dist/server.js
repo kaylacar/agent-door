@@ -18,12 +18,14 @@ class AgentDoor {
     agentsTxt;
     agentsJson;
     agentsJsonPath;
+    corsOrigin;
     routes;
     constructor(config) {
         this.config = config;
         this.basePath = config.basePath ?? '/.well-known';
         this.capabilities = config.capabilities.flat();
         this.rateLimit = config.rateLimit ?? 60;
+        this.corsOrigin = config.corsOrigin ?? '*';
         this.sessionManager = new session_1.SessionManager(config.sessionTtl ?? 3600, this.capabilities);
         this.rateLimiter = new rate_limiter_1.RateLimiter();
         this.auditManager = config.audit ? new audit_1.AuditManager(config.sessionTtl ?? 3600) : null;
@@ -120,7 +122,7 @@ class AgentDoor {
         return async (req, res, next) => {
             // Auto-discovery + CORS on every response
             res.setHeader('Link', `<${this.agentsJsonPath}>; rel="${AGENTS_REL}"`);
-            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Origin', this.corsOrigin);
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
             res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Token');
             if (req.method === 'OPTIONS') {
@@ -146,12 +148,13 @@ class AgentDoor {
     }
     handler() {
         const agentsJsonPath = this.agentsJsonPath;
+        const origin = this.corsOrigin;
         return async (request) => {
             // CORS preflight
             if (request.method === 'OPTIONS') {
                 return new globalThis.Response(null, {
                     status: 204,
-                    headers: corsHeaders(agentsJsonPath),
+                    headers: corsHeaders(agentsJsonPath, origin),
                 });
             }
             const agentReq = await webRequestToAgentRequest(request);
@@ -159,11 +162,11 @@ class AgentDoor {
             if (result === null) {
                 return new globalThis.Response(JSON.stringify({ ok: false, error: 'Not found' }), {
                     status: 404,
-                    headers: { 'Content-Type': 'application/json', ...corsHeaders(agentsJsonPath) },
+                    headers: { 'Content-Type': 'application/json', ...corsHeaders(agentsJsonPath, origin) },
                 });
             }
             const headers = {
-                ...corsHeaders(agentsJsonPath),
+                ...corsHeaders(agentsJsonPath, origin),
                 'Content-Type': result.contentType ?? 'application/json',
             };
             const body = result.contentType
@@ -307,9 +310,9 @@ class AgentDoor {
     }
 }
 exports.AgentDoor = AgentDoor;
-function corsHeaders(agentsJsonPath) {
+function corsHeaders(agentsJsonPath, origin = '*') {
     return {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Token',
         'Link': `<${agentsJsonPath}>; rel="agents"`,

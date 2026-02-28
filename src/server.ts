@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import http from 'http';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
 import { SiteRegistration } from './types';
@@ -21,7 +22,36 @@ const RESERVED_SLUGS = new Set([
   'static', 'assets', 'favicon.ico', 'robots.txt', '.well-known',
 ]);
 
+// --- Admin rate limiter (per-IP, 20 req/min) ---
+const ADMIN_RATE_LIMIT = 20;
+const ADMIN_RATE_WINDOW_MS = 60_000;
+const adminRateWindows = new Map<string, number[]>();
+
+function checkAdminRate(ip: string): boolean {
+  const now = Date.now();
+  const cutoff = now - ADMIN_RATE_WINDOW_MS;
+  let timestamps = adminRateWindows.get(ip);
+  if (!timestamps) {
+    timestamps = [];
+    adminRateWindows.set(ip, timestamps);
+  }
+  // remove expired entries
+  while (timestamps.length > 0 && timestamps[0] <= cutoff) {
+    timestamps.shift();
+  }
+  if (timestamps.length >= ADMIN_RATE_LIMIT) {
+    return false;
+  }
+  timestamps.push(now);
+  return true;
+}
+
 function requireAdminKey(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip ?? req.socket?.remoteAddress ?? 'unknown';
+  if (!checkAdminRate(ip)) {
+    res.status(429).json({ error: 'Rate limit exceeded' });
+    return;
+  }
   const key = process.env.ADMIN_API_KEY;
   if (!key) {
     res.status(503).json({ error: 'ADMIN_API_KEY not configured' });
@@ -38,9 +68,49 @@ function requireAdminKey(req: Request, res: Response, next: NextFunction): void 
   next();
 }
 
+// --- Request logging middleware ---
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+  });
+  next();
+});
+
 app.get('/', (_req, res) => {
   res.json({ service: 'agent-door', version: '0.1.0' });
 });
+
+// --- Build a door from a registration (used by both /register and startup restore) ---
+async function buildDoor(reg: SiteRegistration): Promise<AgentDoor> {
+  const specUrl = reg.openApiUrl ?? `${reg.apiUrl}/openapi.json`;
+  const specRes = await fetch(specUrl);
+  if (!specRes.ok) throw new Error(`${specRes.status} from ${specUrl}`);
+  const spec = await specRes.json();
+  return AgentDoor.fromOpenAPI(spec as any, reg.apiUrl, {
+    site: { name: reg.siteName, url: reg.siteUrl },
+    rateLimit: reg.rateLimit,
+    audit: false,
+    corsOrigin: process.env.CORS_ORIGIN ?? '*',
+  });
+}
+
+// --- Restore doors from persisted registry on startup ---
+async function restoreDoors(): Promise<void> {
+  const sites = registry.list();
+  if (sites.length === 0) return;
+  console.log(`Restoring ${sites.length} site(s) from registry...`);
+  for (const reg of sites) {
+    try {
+      const door = await buildDoor(reg);
+      doors.set(reg.slug, door);
+      console.log(`  restored: ${reg.slug}`);
+    } catch (err: any) {
+      console.error(`  failed to restore ${reg.slug}: ${err.message}`);
+    }
+  }
+}
 
 app.post('/register', requireAdminKey, async (req: Request, res: Response) => {
   const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit } = req.body;
@@ -78,21 +148,6 @@ app.post('/register', requireAdminKey, async (req: Request, res: Response) => {
     return;
   }
 
-  let door: AgentDoor;
-  try {
-    const specRes = await fetch(specUrl);
-    if (!specRes.ok) throw new Error(`${specRes.status} from ${specUrl}`);
-    const spec = await specRes.json();
-    door = AgentDoor.fromOpenAPI(spec as any, resolvedApiUrl, {
-      site: { name: siteName, url: siteUrl },
-      rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-      audit: false,
-    });
-  } catch (err: any) {
-    res.status(400).json({ error: `failed to load spec: ${err.message}` });
-    return;
-  }
-
   const reg: SiteRegistration = {
     slug,
     siteName,
@@ -102,6 +157,15 @@ app.post('/register', requireAdminKey, async (req: Request, res: Response) => {
     rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
     createdAt: new Date(),
   };
+
+  let door: AgentDoor;
+  try {
+    door = await buildDoor(reg);
+  } catch (err: any) {
+    res.status(400).json({ error: `failed to load spec: ${err.message}` });
+    return;
+  }
+
   registry.register(reg);
   doors.set(slug, door);
 
@@ -156,7 +220,32 @@ const PORT = process.env.PORT ?? 3000;
 
 // only listen when run directly, not when imported by tests
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`agent-door listening on :${PORT}`));
+  restoreDoors().then(() => {
+    const server = app.listen(PORT, () => console.log(`agent-door listening on :${PORT}`));
+    setupGracefulShutdown(server);
+  });
 }
 
-export { app };
+// --- Graceful shutdown ---
+function setupGracefulShutdown(server: http.Server): void {
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received, shutting down...`);
+    server.close(() => {
+      for (const door of doors.values()) {
+        door.destroy();
+      }
+      doors.clear();
+      console.log('Shutdown complete');
+      process.exit(0);
+    });
+    // force exit after 10s if connections aren't drained
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+export { app, restoreDoors };

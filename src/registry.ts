@@ -27,7 +27,9 @@ export class Registry {
 
   private flush() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(DB_PATH, JSON.stringify([...this.sites.values()], null, 2));
+    const tmp = `${DB_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...this.sites.values()], null, 2));
+    fs.renameSync(tmp, DB_PATH);
   }
 
   register(reg: SiteRegistration) {

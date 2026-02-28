@@ -80,6 +80,10 @@ class AgentDoor {
                             resolvedPath = resolvedPath.replace(`{${k}}`, encodeURIComponent(v));
                         }
                         const url = new URL(`${baseUrl}${resolvedPath}`);
+                        const expectedOrigin = new URL(baseUrl).origin;
+                        if (url.origin !== expectedOrigin) {
+                            throw new Error('Proxy target escaped allowed origin');
+                        }
                         if (method === 'GET' || method === 'DELETE') {
                             for (const [k, v] of Object.entries(req.query)) {
                                 url.searchParams.set(k, v);
@@ -92,8 +96,9 @@ class AgentDoor {
                         }
                         const response = await fetch(url.toString(), init);
                         if (!response.ok) {
-                            const text = await response.text().catch(() => response.statusText);
-                            throw new Error(`Upstream ${response.status}: ${text}`);
+                            // consume body to free resources, but don't leak it to clients
+                            await response.text().catch(() => {});
+                            throw new Error(`Upstream returned ${response.status}`);
                         }
                         return response.json();
                     },

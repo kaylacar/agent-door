@@ -1,9 +1,9 @@
 # Agent Door — Pre-Production Code Review
 
-**Date:** 2026-02-28
-**Reviewer:** Claude (senior eng, first-day review)
+**Date:** 2026-02-28 (updated)
+**Reviewer:** Claude (senior eng, second review pass)
 **Branch:** `claude/pre-production-code-review-jEjXc`
-**Status:** Critical fixes applied. Remaining items documented below.
+**Status:** Additional security and production fixes applied. Remaining items documented below.
 
 ---
 
@@ -45,6 +45,32 @@ Both `specUrl` and `resolvedApiUrl` are validated in `src/server.ts:73-80`.
 ### 8. Build Restored — FIXED
 `package.json` build script runs `tsc`. `render.yaml` does `npm install && npm run build`.
 
+### 9. Timing-Safe Admin Key Comparison — FIXED
+`requireAdminKey` in `src/server.ts` now uses `crypto.timingSafeEqual()` instead of `===` to compare the API key, preventing timing side-channel attacks on key brute-forcing.
+
+### 10. IPv6 SSRF Bypass — FIXED
+`src/url-guard.ts` had a bug where IPv6 literal URLs (e.g. `http://[::1]/`) bypassed the private IP check. Node's `URL` parser preserves brackets in `hostname`, so `net.isIP('[::1]')` returned `0` and the address fell through to DNS resolution instead of being caught as a private IP. Fixed by stripping brackets before the `net.isIP()` check.
+
+Also fixed IPv4-mapped IPv6 in hex form: the URL parser normalizes `::ffff:127.0.0.1` to `::ffff:7f00:1`, which `isPrivateV6` didn't handle. Added hex-to-dotted conversion for the mapped portion.
+
+### 11. SDK Proxy Origin Validation — FIXED
+`vendor/sdk/dist/server.js` proxy handler now validates that the constructed URL's origin matches the registered `baseUrl` origin before fetching, preventing path-traversal attacks from escaping the intended upstream host.
+
+### 12. Upstream Error Leakage — FIXED
+`vendor/sdk/dist/server.js` no longer includes upstream response bodies in error messages returned to agents. Error messages now only include the HTTP status code (e.g. `Upstream returned 500`).
+
+### 13. Atomic Registry Writes — FIXED
+`src/registry.ts` `flush()` now writes to a temp file then `rename()`s atomically, preventing data corruption from interrupted writes or concurrent flushes.
+
+### 14. Server Listen Guard — FIXED
+`src/server.ts` now only calls `app.listen()` when run directly (`require.main === module`), not when imported by tests. Previously, importing the module in tests would start a listener on port 3000 as a side effect.
+
+### 15. `dist/` Removed from Git — FIXED
+`dist/` added to `.gitignore` and removed from tracking. The build pipeline generates it from source.
+
+### 16. README Updated — FIXED
+Curl examples now include `X-Api-Key` auth header. Response format updated to match actual server output. Misleading "signed audit artifact" claim removed.
+
 ---
 
 ## Required Env Vars (set in Render before deploy)
@@ -59,29 +85,26 @@ Both `specUrl` and `resolvedApiUrl` are validated in `src/server.ts:73-80`.
 
 ## Known Issues Still Open
 
-### HIGH — No persistent storage
-`src/registry.ts` is an in-memory `Map`. The `doors` map in `src/server.ts:11` is also in-memory. Every restart, deploy, or Render free-tier sleep wipes all registrations. This needs a database (Postgres, SQLite, Redis) before this service can be relied on.
-
-### HIGH — Upstream proxy in SDK has no SSRF guard
-The SSRF fix validates URLs at registration time, but the SDK's proxy handler (`vendor/sdk/dist/server.js:82-104`) constructs URLs from `baseUrl` + path parameters at request time. If an attacker can influence path parameters to hit internal services via path traversal in the proxied URL, the guard can be bypassed. The SDK proxy should also validate resolved URLs before fetching, or the `url-guard` module should be integrated into the SDK's `fetch()` calls.
+### HIGH — `doors` Map is in-memory only
+`src/registry.ts` now persists site registrations to `data/sites.json`, but the `doors` Map in `src/server.ts:11` (which holds live `AgentDoor` instances) is rebuilt only when sites are registered. On restart, registrations survive in the JSON file but the `AgentDoor` middleware instances are lost. The server needs a startup routine that reconstructs `AgentDoor` instances from the registry, or the entire system needs a database-backed approach.
 
 ### MEDIUM — CORS is `Access-Control-Allow-Origin: *`
-`vendor/sdk/dist/server.js:125` sets wide-open CORS on every response. Any webpage can make requests through the gateway. Consider restricting to known agent origins or at minimum not reflecting credentials.
+`vendor/sdk/dist/server.js:118` sets wide-open CORS on every response. Any webpage can make requests through the gateway. Consider restricting to known agent origins or at minimum not reflecting credentials.
 
-### MEDIUM — No tests
-Zero test files exist. No CI pipeline. The security-critical `url-guard` module especially needs unit tests covering: private IPv4, private IPv6, IPv4-mapped IPv6, DNS resolution to private IP, valid external URLs, edge cases (localhost, 0.0.0.0, etc.).
+### MEDIUM — No rate limiting on admin endpoints
+The `requireAdminKey` middleware has no rate limiting. An attacker can brute-force the API key (mitigated by timing-safe comparison, but not prevented). Consider adding rate limiting to `/register`, `GET /sites`, and `DELETE /sites/:slug`.
 
-### MEDIUM — Upstream error leakage
-`vendor/sdk/dist/server.js:100-101` passes full upstream response bodies into error messages returned to agents. This can leak internal API details, stack traces, or credentials from proxied services.
-
-### LOW — `dist/` committed to git
-The compiled output is checked into the repo. Now that `build` runs `tsc` properly, consider adding `dist/` to `.gitignore` and letting the deploy pipeline build from source.
+### MEDIUM — Session tokens are UUIDs
+`vendor/sdk/dist/session.js:16` uses `uuid.v4()`. Consider `crypto.randomBytes(32).toString('hex')` if sessions ever carry authorization weight.
 
 ### LOW — Render free tier
 Free tier has cold starts, sleeps after 15 min inactivity, and limited bandwidth. Not suitable for a production gateway that agents depend on.
 
-### LOW — No rate limiting on admin endpoints
-The `requireAdminKey` middleware has no rate limiting. An attacker can brute-force the API key. Consider adding rate limiting to `/register`, `GET /sites`, and `DELETE /sites/:slug`.
+### LOW — No graceful shutdown
+No SIGTERM handler — in-flight requests are dropped and cleanup intervals in `SessionManager`/`RateLimiter` are never cleared on shutdown.
+
+### LOW — No request logging
+No structured logging for requests, auth events, or errors. Add a logging library (pino, winston) for production observability.
 
 ---
 

@@ -19,9 +19,12 @@ No code changes to your site. No SDK to install. One registration call.
 
 ## Register a site
 
+Admin endpoints require an API key (set via `ADMIN_API_KEY` env var):
+
 ```bash
 curl -X POST https://agentdoor.io/register \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $ADMIN_API_KEY" \
   -d '{
     "slug": "my-store",
     "siteName": "My Store",
@@ -34,13 +37,10 @@ Response:
 
 ```json
 {
-  "ok": true,
-  "data": {
-    "slug": "my-store",
-    "gateway_url": "https://agentdoor.io/my-store",
-    "agents_txt": "https://agentdoor.io/my-store/.well-known/agents.txt",
-    "agents_json": "https://agentdoor.io/my-store/.well-known/agents.json"
-  }
+  "slug": "my-store",
+  "gatewayUrl": "https://agentdoor.io/my-store",
+  "agentsTxt": "https://agentdoor.io/my-store/.well-known/agents.txt",
+  "agentsJson": "https://agentdoor.io/my-store/.well-known/agents.json"
 }
 ```
 
@@ -55,7 +55,7 @@ Agents can now discover and interact with your site through the gateway.
 - `POST /my-store/.well-known/agents/api/session` — create a session
 - `GET /my-store/.well-known/agents/api/*` — all capabilities declared in your spec
 
-Every session gets a signed audit artifact showing exactly what the agent did.
+Sessions track agent activity through the gateway.
 
 ---
 
@@ -66,11 +66,17 @@ npm install
 npm run dev
 ```
 
-The gateway runs on port 3000. Register a local site:
+The gateway runs on port 3000. Set `ADMIN_API_KEY` and register a local site:
+
+```bash
+export ADMIN_API_KEY=dev-key-change-me
+npm run dev
+```
 
 ```bash
 curl -X POST http://localhost:3000/register \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $ADMIN_API_KEY" \
   -d '{
     "slug": "test",
     "siteName": "Test API",

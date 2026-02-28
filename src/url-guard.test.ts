@@ -37,4 +37,28 @@ describe('validateExternalUrl', () => {
     // resolves to 127.0.0.1 which should be caught
     await expect(validateExternalUrl('http://localhost/')).rejects.toThrow();
   });
+
+  it('blocks IPv6 loopback', async () => {
+    await expect(validateExternalUrl('http://[::1]/')).rejects.toThrow('private/internal');
+  });
+
+  it('blocks IPv6 link-local', async () => {
+    await expect(validateExternalUrl('http://[fe80::1]/')).rejects.toThrow('private/internal');
+  });
+
+  it('blocks IPv6 unique-local (fc/fd)', async () => {
+    await expect(validateExternalUrl('http://[fc00::1]/')).rejects.toThrow('private/internal');
+    await expect(validateExternalUrl('http://[fd12::1]/')).rejects.toThrow('private/internal');
+  });
+
+  it('blocks IPv4-mapped IPv6', async () => {
+    await expect(validateExternalUrl('http://[::ffff:127.0.0.1]/')).rejects.toThrow('private/internal');
+    await expect(validateExternalUrl('http://[::ffff:10.0.0.1]/')).rejects.toThrow('private/internal');
+  });
+
+  it('allows valid external IP URLs', async () => {
+    // public IPs should pass (no DNS needed)
+    await expect(validateExternalUrl('http://8.8.8.8/')).resolves.toBeUndefined();
+    await expect(validateExternalUrl('https://1.1.1.1/')).resolves.toBeUndefined();
+  });
 });

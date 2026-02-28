@@ -16,8 +16,21 @@ function isPrivateV6(ip: string) {
   const l = ip.toLowerCase();
   if (l === '::1' || l === '::') return true;
   if (l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe80')) return true;
-  // v4-mapped v6
-  if (l.startsWith('::ffff:')) return isPrivateV4(l.slice(7));
+  // v4-mapped v6: can be dotted (::ffff:127.0.0.1) or hex (::ffff:7f00:1)
+  if (l.startsWith('::ffff:')) {
+    const mapped = l.slice(7);
+    if (net.isIPv4(mapped)) return isPrivateV4(mapped);
+    // hex form: convert two 16-bit groups to IPv4
+    const parts = mapped.split(':');
+    if (parts.length === 2) {
+      const hi = parseInt(parts[0], 16);
+      const lo = parseInt(parts[1], 16);
+      if (!isNaN(hi) && !isNaN(lo)) {
+        const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        return isPrivateV4(dotted);
+      }
+    }
+  }
   return false;
 }
 
@@ -39,7 +52,8 @@ export async function validateExternalUrl(rawUrl: string) {
     throw new Error('only http/https allowed');
   }
 
-  const host = parsed.hostname;
+  // URL parser keeps brackets on IPv6 literals (e.g. "[::1]"), strip them
+  const host = parsed.hostname.replace(/^\[|\]$/g, '');
 
   if (net.isIP(host)) {
     if (isPrivate(host)) throw new Error('private/internal address');

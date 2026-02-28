@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
 import { SiteRegistration } from './types';
@@ -28,7 +29,9 @@ function requireAdminKey(req: Request, res: Response, next: NextFunction): void 
   }
   const provided = req.headers['x-api-key']
     ?? req.headers['authorization']?.replace(/^Bearer\s+/i, '');
-  if (provided !== key) {
+  if (typeof provided !== 'string'
+    || provided.length !== key.length
+    || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(key))) {
     res.status(401).json({ error: 'Invalid or missing API key' });
     return;
   }
@@ -150,6 +153,10 @@ app.use('/:slug', (req, res, next) => {
 });
 
 const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => console.log(`agent-door listening on :${PORT}`));
+
+// only listen when run directly, not when imported by tests
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`agent-door listening on :${PORT}`));
+}
 
 export { app };

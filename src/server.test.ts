@@ -133,3 +133,22 @@ describe('sites list', () => {
     expect(Array.isArray(await res.json())).toBe(true);
   });
 });
+
+describe('delete', () => {
+  it('returns 404 for unknown slug', async () => {
+    const res = await fetch(`${base}/sites/nonexistent`, {
+      method: 'DELETE',
+      headers: AUTH,
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('single-char slug', () => {
+  it('rejects single-char slugs (regex requires 2+)', async () => {
+    const res = await post('/register', {
+      slug: 'x', siteName: 'T', siteUrl: 'https://example.com', apiUrl: 'https://example.com',
+    }, AUTH);
+    expect(res.status).toBe(400);
+  });
+});

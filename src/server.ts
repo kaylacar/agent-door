@@ -1,13 +1,86 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
 import { SiteRegistration } from './types';
+import { URL } from 'url';
 
 const app = express();
 app.use(express.json());
 
 const registry = new Registry();
 const doors = new Map<string, AgentDoor>();
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+const GATEWAY_BASE_URL = process.env.GATEWAY_BASE_URL ?? '';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? '';
+const MAX_REGISTRATIONS = parseInt(process.env.MAX_REGISTRATIONS ?? '100', 10);
+
+// ─── SSRF protection ─────────────────────────────────────────────────────────
+
+function isPublicUrl(input: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    return false;
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return false;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // Block loopback
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]') {
+    return false;
+  }
+
+  // Block link-local / metadata (AWS, GCP, Azure)
+  if (hostname === '169.254.169.254' || hostname === 'metadata.google.internal') {
+    return false;
+  }
+
+  // Block private RFC-1918 ranges
+  const ipv4Match = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const [, a, b] = ipv4Match.map(Number);
+    if (a === 10) return false;                          // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return false;   // 172.16.0.0/12
+    if (a === 192 && b === 168) return false;             // 192.168.0.0/16
+    if (a === 0) return false;                            // 0.0.0.0/8
+  }
+
+  return true;
+}
+
+// ─── Admin auth middleware ────────────────────────────────────────────────────
+
+function requireAdminKey(req: Request, res: Response, next: NextFunction): void {
+  if (!ADMIN_API_KEY) {
+    // No key configured — allow (development mode)
+    next();
+    return;
+  }
+  const provided = req.headers['x-api-key'] ?? req.headers['authorization']?.replace(/^Bearer\s+/i, '');
+  if (provided !== ADMIN_API_KEY) {
+    res.status(401).json({ ok: false, error: 'Invalid or missing API key' });
+    return;
+  }
+  next();
+}
+
+// ─── Gateway URL helper ──────────────────────────────────────────────────────
+
+function gatewayUrl(req: Request, slug: string): string {
+  if (GATEWAY_BASE_URL) {
+    return `${GATEWAY_BASE_URL.replace(/\/$/, '')}/${slug}`;
+  }
+  const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
+  const host = req.headers['x-forwarded-host'] ?? req.get('host') ?? 'localhost';
+  return `${proto}://${host}/${slug}`;
+}
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 
@@ -17,7 +90,7 @@ app.get('/', (_req, res) => {
 
 // ─── Registration ─────────────────────────────────────────────────────────────
 
-app.post('/register', async (req: Request, res: Response) => {
+app.post('/register', requireAdminKey, async (req: Request, res: Response) => {
   const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit, audit } = req.body as Record<string, unknown>;
 
   if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
@@ -37,22 +110,37 @@ app.post('/register', async (req: Request, res: Response) => {
     return;
   }
 
+  // Bound memory: limit total registrations
+  if (doors.size >= MAX_REGISTRATIONS) {
+    res.status(503).json({ ok: false, error: 'Maximum number of registrations reached' });
+    return;
+  }
+
   const resolvedApiUrl = (typeof apiUrl === 'string' ? apiUrl : siteUrl).replace(/\/$/, '');
   const specUrl = typeof openApiUrl === 'string' ? openApiUrl : `${resolvedApiUrl}/openapi.json`;
+
+  // SSRF protection: validate both URLs resolve to public addresses
+  if (!isPublicUrl(specUrl)) {
+    res.status(400).json({ ok: false, error: 'openApiUrl must be a public HTTP(S) URL' });
+    return;
+  }
+  if (!isPublicUrl(resolvedApiUrl)) {
+    res.status(400).json({ ok: false, error: 'apiUrl must be a public HTTP(S) URL' });
+    return;
+  }
 
   let door: AgentDoor;
   try {
     const specRes = await fetch(specUrl);
-    if (!specRes.ok) throw new Error(`HTTP ${specRes.status} fetching spec`);
+    if (!specRes.ok) throw new Error(`HTTP ${specRes.status}`);
     const spec = await specRes.json();
     door = AgentDoor.fromOpenAPI(spec as unknown as Parameters<typeof AgentDoor.fromOpenAPI>[0], resolvedApiUrl, {
       site: { name: siteName, url: siteUrl },
       rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
       audit: audit === true,
     });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(400).json({ ok: false, error: `Could not load OpenAPI spec from ${specUrl}: ${message}` });
+  } catch {
+    res.status(400).json({ ok: false, error: 'Could not load OpenAPI spec from the provided URL' });
     return;
   }
 
@@ -70,25 +158,25 @@ app.post('/register', async (req: Request, res: Response) => {
   registry.register(reg);
   doors.set(slug, door);
 
+  const base = gatewayUrl(req, slug);
   res.json({
     ok: true,
     data: {
       slug,
-      gateway_url: `https://agentdoor.io/${slug}`,
-      agents_txt: `https://agentdoor.io/${slug}/.well-known/agents.txt`,
-      agents_json: `https://agentdoor.io/${slug}/.well-known/agents.json`,
+      gateway_url: base,
+      agents_txt: `${base}/.well-known/agents.txt`,
+      agents_json: `${base}/.well-known/agents.json`,
     },
   });
 });
 
 // ─── List registered sites ────────────────────────────────────────────────────
 
-app.get('/sites', (_req, res) => {
+app.get('/sites', requireAdminKey, (_req: Request, res: Response) => {
   const sites = registry.list().map(s => ({
     slug: s.slug,
     siteName: s.siteName,
     siteUrl: s.siteUrl,
-    gateway_url: `https://agentdoor.io/${s.slug}`,
     createdAt: s.createdAt,
   }));
   res.json({ ok: true, data: sites });
@@ -96,7 +184,7 @@ app.get('/sites', (_req, res) => {
 
 // ─── Delete a registration ────────────────────────────────────────────────────
 
-app.delete('/sites/:slug', (req, res) => {
+app.delete('/sites/:slug', requireAdminKey, (req: Request, res: Response) => {
   const { slug } = req.params;
   const door = doors.get(slug);
   if (!door) {
@@ -119,9 +207,10 @@ app.use('/:slug', (req, res, next) => {
     return;
   }
 
-  // Strip the slug prefix before passing to the door middleware
+  // Strip the slug prefix using substring instead of regex
   const original = req.url;
-  req.url = original.replace(new RegExp(`^/${slug}`), '') || '/';
+  const prefix = `/${slug}`;
+  req.url = original.startsWith(prefix) ? original.substring(prefix.length) || '/' : original;
 
   door.middleware()(req, res, () => {
     // Restore URL if the door didn't handle it

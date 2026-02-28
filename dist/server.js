@@ -7,18 +7,39 @@ exports.app = void 0;
 const express_1 = __importDefault(require("express"));
 const sdk_1 = require("@agents-protocol/sdk");
 const registry_1 = require("./registry");
+const url_guard_1 = require("./url-guard");
 const app = (0, express_1.default)();
 exports.app = app;
-app.use(express_1.default.json());
+app.use(express_1.default.json({ limit: '1mb' }));
 const registry = new registry_1.Registry();
 const doors = new Map();
+const BASE_URL = (process.env.BASE_URL ?? 'https://agentdoor.io').replace(/\/$/, '');
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? '';
+const RESERVED_SLUGS = new Set([
+    'register', 'sites', 'health', 'admin', 'api', 'static', 'assets',
+    'favicon.ico', 'robots.txt', '.well-known',
+]);
+// ─── Admin auth middleware ────────────────────────────────────────────────────
+function requireAdminKey(req, res, next) {
+    if (!ADMIN_API_KEY) {
+        // No key configured — reject all admin requests so the operator notices
+        res.status(503).json({ ok: false, error: 'ADMIN_API_KEY not configured' });
+        return;
+    }
+    const provided = req.headers['x-api-key'] ?? req.headers['authorization']?.replace(/^Bearer\s+/i, '');
+    if (provided !== ADMIN_API_KEY) {
+        res.status(401).json({ ok: false, error: 'Invalid or missing API key' });
+        return;
+    }
+    next();
+}
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
     res.json({ ok: true, service: 'Agent Door Gateway', version: '0.1.0' });
 });
 // ─── Registration ─────────────────────────────────────────────────────────────
-app.post('/register', async (req, res) => {
-    const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit, audit } = req.body;
+app.post('/register', requireAdminKey, async (req, res) => {
+    const { slug, siteName, siteUrl, apiUrl, openApiUrl, rateLimit } = req.body;
     if (typeof slug !== 'string' || typeof siteName !== 'string' || typeof siteUrl !== 'string') {
         res.status(400).json({ ok: false, error: 'Missing required fields: slug, siteName, siteUrl' });
         return;
@@ -31,12 +52,26 @@ app.post('/register', async (req, res) => {
         res.status(400).json({ ok: false, error: 'slug must be 2-40 lowercase letters, numbers, or hyphens' });
         return;
     }
+    if (RESERVED_SLUGS.has(slug)) {
+        res.status(400).json({ ok: false, error: `Slug '${slug}' is reserved` });
+        return;
+    }
     if (doors.has(slug)) {
         res.status(409).json({ ok: false, error: `Slug '${slug}' is already registered` });
         return;
     }
     const resolvedApiUrl = (typeof apiUrl === 'string' ? apiUrl : siteUrl).replace(/\/$/, '');
     const specUrl = typeof openApiUrl === 'string' ? openApiUrl : `${resolvedApiUrl}/openapi.json`;
+    // SSRF protection: validate both the spec URL and the API base URL
+    try {
+        await (0, url_guard_1.validateExternalUrl)(specUrl);
+        await (0, url_guard_1.validateExternalUrl)(resolvedApiUrl);
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.status(400).json({ ok: false, error: `URL validation failed: ${message}` });
+        return;
+    }
     let door;
     try {
         const specRes = await fetch(specUrl);
@@ -46,7 +81,7 @@ app.post('/register', async (req, res) => {
         door = sdk_1.AgentDoor.fromOpenAPI(spec, resolvedApiUrl, {
             site: { name: siteName, url: siteUrl },
             rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-            audit: audit === true,
+            audit: false,
         });
     }
     catch (err) {
@@ -61,7 +96,7 @@ app.post('/register', async (req, res) => {
         apiUrl: resolvedApiUrl,
         openApiUrl: typeof openApiUrl === 'string' ? openApiUrl : undefined,
         rateLimit: typeof rateLimit === 'number' ? rateLimit : 60,
-        audit: audit === true,
+        audit: false,
         createdAt: new Date(),
     };
     registry.register(reg);
@@ -70,25 +105,25 @@ app.post('/register', async (req, res) => {
         ok: true,
         data: {
             slug,
-            gateway_url: `https://agentdoor.io/${slug}`,
-            agents_txt: `https://agentdoor.io/${slug}/.well-known/agents.txt`,
-            agents_json: `https://agentdoor.io/${slug}/.well-known/agents.json`,
+            gateway_url: `${BASE_URL}/${slug}`,
+            agents_txt: `${BASE_URL}/${slug}/.well-known/agents.txt`,
+            agents_json: `${BASE_URL}/${slug}/.well-known/agents.json`,
         },
     });
 });
 // ─── List registered sites ────────────────────────────────────────────────────
-app.get('/sites', (_req, res) => {
+app.get('/sites', requireAdminKey, (_req, res) => {
     const sites = registry.list().map(s => ({
         slug: s.slug,
         siteName: s.siteName,
         siteUrl: s.siteUrl,
-        gateway_url: `https://agentdoor.io/${s.slug}`,
+        gateway_url: `${BASE_URL}/${s.slug}`,
         createdAt: s.createdAt,
     }));
     res.json({ ok: true, data: sites });
 });
 // ─── Delete a registration ────────────────────────────────────────────────────
-app.delete('/sites/:slug', (req, res) => {
+app.delete('/sites/:slug', requireAdminKey, (req, res) => {
     const { slug } = req.params;
     const door = doors.get(slug);
     if (!door) {
@@ -110,7 +145,8 @@ app.use('/:slug', (req, res, next) => {
     }
     // Strip the slug prefix before passing to the door middleware
     const original = req.url;
-    req.url = original.replace(new RegExp(`^/${slug}`), '') || '/';
+    const prefix = `/${slug}`;
+    req.url = original.startsWith(prefix) ? (original.slice(prefix.length) || '/') : original;
     door.middleware()(req, res, () => {
         // Restore URL if the door didn't handle it
         req.url = original;

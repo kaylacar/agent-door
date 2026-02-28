@@ -6,8 +6,9 @@ import { timingSafeEqual, randomUUID } from 'crypto';
 import { join } from 'path';
 import { AgentDoor } from '@agents-protocol/sdk';
 import { Registry } from './registry';
-import { SiteRegistration, CreateAppOptions } from './types';
+import { SiteRegistration, IRegistry, CreateAppOptions } from './types';
 import { config } from './config';
+import { PgRegistry } from './pg-registry';
 
 // ─── URL validation (SSRF prevention) ──────────────────────────────────────
 
@@ -60,7 +61,8 @@ async function fetchSpec(specUrl: string): Promise<unknown> {
 export function createApp(options: CreateAppOptions = {}) {
   const apiKey = options.apiKey ?? config.apiKey;
   const gatewayUrl = options.gatewayUrl ?? config.gatewayUrl;
-  const registry = options.registry ?? new Registry(join(config.dataDir, 'registry.json'));
+  const registry: IRegistry = options.registry
+    ?? (config.databaseUrl ? new PgRegistry(config.databaseUrl) : new Registry(join(config.dataDir, 'registry.json')));
   const doors = new Map<string, AgentDoor>();
   const startedAt = Date.now();
   const metrics = {
@@ -151,13 +153,14 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // ─── Metrics ───────────────────────────────────────────────────────────────
 
-  app.get('/metrics', requireAuth, (_req, res) => {
+  app.get('/metrics', requireAuth, async (_req, res) => {
+    const regs = await registry.list();
     res.json({
       ok: true,
       data: {
         uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
         doors: doors.size,
-        registrations: registry.list().length,
+        registrations: regs.length,
         requests: {
           total: metrics.totalRequests,
           avg_duration_ms: metrics.totalRequests > 0
@@ -333,7 +336,7 @@ export function createApp(options: CreateAppOptions = {}) {
       createdAt: new Date(),
     };
 
-    registry.register(reg);
+    await registry.register(reg);
     doors.set(slug, door);
 
     res.json({
@@ -349,8 +352,9 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // ─── List registered sites (protected) ──────────────────────────────────────
 
-  app.get('/sites', requireAuth, (_req, res) => {
-    const sites = registry.list().map(s => ({
+  app.get('/sites', requireAuth, async (_req, res) => {
+    const regs = await registry.list();
+    const sites = regs.map(s => ({
       slug: s.slug,
       siteName: s.siteName,
       siteUrl: s.siteUrl,
@@ -362,7 +366,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // ─── Delete a registration (protected) ──────────────────────────────────────
 
-  app.delete('/sites/:slug', requireAuth, (req, res) => {
+  app.delete('/sites/:slug', requireAuth, async (req, res) => {
     const { slug } = req.params;
     const door = doors.get(slug);
     if (!door) {
@@ -371,7 +375,7 @@ export function createApp(options: CreateAppOptions = {}) {
     }
     door.destroy();
     doors.delete(slug);
-    registry.delete(slug);
+    await registry.delete(slug);
     res.json({ ok: true, data: { slug, deleted: true } });
   });
 
@@ -412,7 +416,7 @@ export function createApp(options: CreateAppOptions = {}) {
   // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
   async function boot(): Promise<void> {
-    for (const reg of registry.list()) {
+    for (const reg of await registry.list()) {
       if (doors.has(reg.slug)) continue;
       const specUrl = reg.openApiUrl ?? `${reg.apiUrl}/openapi.json`;
       try {
@@ -431,11 +435,12 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   }
 
-  function shutdown(): void {
+  async function shutdown(): Promise<void> {
     for (const [, door] of doors) {
       try { door.destroy(); } catch { /* ignore */ }
     }
     doors.clear();
+    if (registry.close) await registry.close();
   }
 
   return { app, registry, doors, boot, shutdown };

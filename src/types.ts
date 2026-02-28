@@ -9,8 +9,16 @@ export interface SiteRegistration {
   createdAt: Date;
 }
 
+export interface IRegistry {
+  register(reg: SiteRegistration): void | Promise<void>;
+  get(slug: string): SiteRegistration | null | Promise<SiteRegistration | null>;
+  list(): SiteRegistration[] | Promise<SiteRegistration[]>;
+  delete(slug: string): boolean | Promise<boolean>;
+  close?(): void | Promise<void>;
+}
+
 export interface CreateAppOptions {
-  registry?: import('./registry').Registry;
+  registry?: IRegistry;
   apiKey?: string;
   gatewayUrl?: string;
   corsOrigins?: string[];

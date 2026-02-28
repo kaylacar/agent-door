@@ -11,6 +11,7 @@ export const config = {
   apiKey: process.env.API_KEY ?? '',
   gatewayUrl: (process.env.GATEWAY_URL ?? 'http://localhost:3000').replace(/\/$/, ''),
   dataDir: process.env.DATA_DIR ?? './data',
+  databaseUrl: process.env.DATABASE_URL ?? '',
   corsOrigins: process.env.CORS_ORIGINS ?? '',
   rateLimit: {
     windowMs: parseIntStrict(process.env.RATE_LIMIT_WINDOW_MS ?? '60000', 'RATE_LIMIT_WINDOW_MS'),
